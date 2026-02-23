@@ -1,0 +1,13 @@
+# Python
+__pycache__/
+*.py[cod]
+venv/
+
+# Environment
+.env
+
+# Claude Code
+.claude/
+
+# Instance state
+.instance_state.json
