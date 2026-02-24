@@ -8,7 +8,7 @@ A bridge that lets users control Claude Code (CLI) from Slack on their Mac. Mult
 
 Channel mode only: Whitelisted users/channels (`SLACK_ALLOWED_USERS`, `SLACK_ALLOWED_CHANNELS`). Requires `@bot` mention for top-level messages. Thread replies to tracked sessions are forwarded without mention.
 
-Channels must be bound to project roots via `bind`/`unbind` commands before tasks can run. Unbound channels cannot execute tasks. `bind fork [PID]` bridges a running Claude CLI process into the Project+Session model — I/O forwarding while alive, `--resume` continuation after death.
+Channels must be bound to project roots via `bind`/`unbind` commands before tasks can run. Unbound channels cannot execute tasks. `bind -p <PID>` bridges a running Claude CLI process into the Project+Session model — I/O forwarding while alive, `--resume` continuation after death.
 
 ## Running
 
@@ -40,9 +40,9 @@ Everything is in a single file: `bridge.py`. No tests exist.
 
 - **Slack event handler** — `handle_message` is the main event handler. Routes channel events (whitelisted, mention required for top-level). Thread reply routing: (1) `instance_threads` with active PTY → forward to CLI, (2) session exists with no active task → auto-resume via new task, (3) session exists with active task → forward to PTY. `_dispatch_command` is the command parser. `handle_mention` (`app_mention` event) is a no-op to avoid duplicate processing.
 
-- **Notifications** — `NOTIFICATION_CHANNEL` (optional) receives startup/shutdown notifications and instance detection results. If unset, these are logged only.
+- **Notifications** — `NOTIFICATION_CHANNEL` (optional) receives startup/shutdown notifications. If unset, these are logged only.
 
-- **Instance detection** — `detect_running_claude_instances()` finds existing `claude` CLI processes on the Mac. Detected instances get a Slack thread in `NOTIFICATION_CHANNEL`; replies to that thread are forwarded to the CLI via TTY. Instance state is persisted to `.instance_state.json` across restarts.
+- **bind -p** — `detect_running_claude_instances()` finds existing `claude` CLI processes on the Mac. `bind -p <PID>` integrates a running process into the Project+Session model with I/O forwarding while alive and `--resume` continuation after death.
 
 ### Data Flow
 
@@ -60,7 +60,6 @@ Thread replies to a session's Slack thread automatically create new tasks with `
 ### Persistence
 
 - `channel_projects.json` — Project `channel_id → root_dir` mapping only. Format unchanged from the old `_channel_projects` dict.
-- `.instance_state.json` — External CLI instance tracking (PID → thread_ts).
 - Sessions and Tasks are volatile (in-memory only, lost on bridge restart).
 
 ## Language
