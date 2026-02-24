@@ -11,3 +11,6 @@ venv/
 
 # Instance state
 .instance_state.json
+
+# Channel project bindings
+channel_projects.json
