@@ -18,11 +18,11 @@ Mac上で動くClaude CodeをSlackから操作するブリッジ。
   sessions                  → プロジェクト内セッション一覧
   cancel #id                → タスクをキャンセル
   cancel all                → プロジェクト内全タスクをキャンセル
-  bind <path>               → チャンネルにプロジェクトルートを紐付け
-  bind fork [PID]           → 実行中のclaude CLIプロセスをフォーク
+  bind                      → usage表示＋バインド可能なプロセスリスト
+  bind -d <path>            → チャンネルにプロジェクトルートを紐付け
+  bind -p <PID>             → 実行中のclaude CLIプロセスをフォーク
   unbind                    → プロジェクトルートの紐付けを解除
   tools <list>              → 次回タスクの許可ツール設定（スレッド内のみ）
-  detect                    → 実行中のclaude CLIインスタンスを検出・接続
   help                      → ヘルプ表示
 """
 
@@ -79,7 +79,6 @@ DEFAULT_ALLOWED_TOOLS = os.getenv(
 )
 
 MAX_SLACK_MSG_LENGTH = 3000
-INSTANCE_STATE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".instance_state.json")
 CHANNEL_PROJECTS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "channel_projects.json")
 
 
@@ -784,7 +783,6 @@ def _monitor_session_jsonl(inst: dict, thread_ts: str, channel: str, client: Web
         for ts, data in list(instance_threads.items()):
             if data is inst:
                 instance_threads.pop(ts, None)
-                _save_instance_state()
                 break
 
 
@@ -1432,7 +1430,6 @@ def _monitor_terminal_output(inst: dict, thread_ts: str, channel: str, client: W
         for ts, data in list(instance_threads.items()):
             if data is inst:
                 instance_threads.pop(ts, None)
-                _save_instance_state()
                 break
 
 
@@ -1518,6 +1515,7 @@ class ClaudeCodeRunner:
             cmd.extend(["--resume", task.resume_session])
 
         if prompt_as_arg:
+            cmd.append("--")
             cmd.append(task.prompt)
 
         return cmd
@@ -1823,115 +1821,11 @@ runner = ClaudeCodeRunner(slack_client)
 # スレッドts → インスタンス情報のマッピング（起動時に検出したclaude CLIプロセス用）
 instance_threads: dict[str, dict] = {}
 
-# bind fork の複数候補選択状態（channel_id → 選択情報）
+# bind -p / bind（引数なし）の複数候補選択状態（channel_id → 選択情報）
 pending_fork_selections: dict[str, dict] = {}
 
 
-def _save_instance_state():
-    """instance_threads の状態をファイルに永続化（bridge起動タスクはttyなしのため除外）"""
-    state = {}
-    for thread_ts, data in instance_threads.items():
-        if not data.get("tty"):
-            continue  # bridge起動タスク（ptyのみ、ttyなし）は永続化対象外
-        state[thread_ts] = {
-            "pid": data["pid"],
-            "tty": data.get("tty", ""),
-            "cwd": data.get("cwd", ""),
-        }
-    try:
-        with open(INSTANCE_STATE_FILE, "w") as f:
-            json.dump(state, f, ensure_ascii=False, indent=2)
-    except Exception as e:
-        logger.warning("インスタンス状態の保存に失敗: %s", e)
-
-
-def _load_instance_state() -> dict[int, str]:
-    """保存された状態からPID → thread_tsマッピングを読み込み。
-    生存していないPIDは除外する。"""
-    try:
-        with open(INSTANCE_STATE_FILE, "r") as f:
-            state = json.load(f)
-        pid_to_ts: dict[int, str] = {}
-        for thread_ts, data in state.items():
-            pid = data.get("pid")
-            if pid and _is_process_alive(pid):
-                pid_to_ts[pid] = thread_ts
-        return pid_to_ts
-    except (FileNotFoundError, json.JSONDecodeError):
-        return {}
-    except Exception as e:
-        logger.warning("インスタンス状態の読み込みに失敗: %s", e)
-        return {}
-
 BOT_USER_ID = None
-
-
-def _register_instance(inst: dict, reuse_thread_ts: str | None = None) -> str | None:
-    """claude CLIインスタンスをSlackスレッドに登録し、監視を開始する。
-    reuse_thread_ts が指定された場合、新しいスレッドを作成せず既存スレッドを再利用する。
-    成功時はthread_tsを返す。NOTIFICATION_CHANNEL未設定時はNone。"""
-    if not NOTIFICATION_CHANNEL:
-        return None
-    # 既に同じPIDが登録済みならスキップ
-    for data in instance_threads.values():
-        if data["pid"] == inst["pid"]:
-            return None
-
-    # JSONL検出を試みる
-    jsonl_path = _find_session_jsonl(inst["cwd"])
-    monitor_label = "JSONL" if jsonl_path else "Terminal"
-
-    if reuse_thread_ts:
-        # 前回のスレッドを再利用（再起動時）
-        thread_ts = reuse_thread_ts
-        try:
-            slack_client.chat_postMessage(
-                channel=NOTIFICATION_CHANNEL,
-                thread_ts=thread_ts,
-                text=f":recycle: Bridge再起動 — PID {inst['pid']} の監視を再開します（{monitor_label}）",
-            )
-        except Exception as e:
-            logger.warning("復元通知の送信に失敗: %s", e)
-    else:
-        resp = slack_client.chat_postMessage(
-            channel=NOTIFICATION_CHANNEL,
-            text=(
-                f":computer: *実行中のClaude Code* (PID {inst['pid']})\n"
-                f":file_folder: `{inst['cwd']}`\n"
-                f":clock1: 経過: {inst['etime']}\n"
-                f":mag: 監視: {monitor_label}\n"
-                "_このスレッドに返信するとclaude CLIに入力を送信します_"
-            ),
-        )
-        thread_ts = resp["ts"]
-
-    thread_data = {
-        "pid": inst["pid"],
-        "tty": inst["tty"],
-        "cwd": inst["cwd"],
-    }
-    instance_threads[thread_ts] = thread_data
-
-    if jsonl_path:
-        # JSONL監視モード
-        thread_data["jsonl_path"] = jsonl_path
-        monitor_target = _monitor_session_jsonl
-    else:
-        # 既存のターミナル監視にフォールバック
-        tty_device = f"/dev/{inst['tty']}"
-        initial_content = _read_terminal_contents(tty_device) or ""
-        thread_data["passive_baseline_len"] = len(initial_content)
-        thread_data["passive_baseline_marker"] = initial_content[-500:] if len(initial_content) >= 500 else initial_content
-        monitor_target = _monitor_terminal_output
-
-    monitor = threading.Thread(
-        target=monitor_target,
-        args=(thread_data, thread_ts, NOTIFICATION_CHANNEL, slack_client),
-        daemon=True,
-    )
-    monitor.start()
-    _save_instance_state()
-    return thread_ts
 
 
 def get_bot_user_id():
@@ -2090,14 +1984,9 @@ def _dispatch_command(text: str, event: dict, say):
         _handle_cancel(text, say, thread_ts, channel_id)
         return
 
-    # ── bind fork [PID] ──
-    if cmd_lower.startswith("bind fork"):
-        _handle_bind_fork(text, say, thread_ts, channel_id, user_id)
-        return
-
-    # ── bind <path> ──
-    if cmd_lower.startswith("bind "):
-        _handle_bind(text, say, thread_ts, channel_id)
+    # ── bind [-d <path> | -p <PID>] ──
+    if cmd_lower == "bind" or cmd_lower.startswith("bind "):
+        _handle_bind(text, say, thread_ts, channel_id, user_id)
         return
 
     # ── unbind ──
@@ -2108,11 +1997,6 @@ def _dispatch_command(text: str, event: dict, say):
     # ── sessions ──
     if cmd_lower == "sessions":
         _handle_sessions(say, thread_ts, channel_id)
-        return
-
-    # ── detect ──
-    if cmd_lower == "detect":
-        _handle_detect(say, thread_ts)
         return
 
     # ── tools <list> （トップレベルではエラー） ──
@@ -2140,7 +2024,7 @@ def _dispatch_command(text: str, event: dict, say):
     project = runner.get_project(channel_id)
     if not project:
         say(
-            text=":warning: このチャンネルにはプロジェクトが設定されていません。\n`bind <path>` でプロジェクトルートを設定してください。",
+            text=":warning: このチャンネルにはプロジェクトが設定されていません。\n`bind -d <path>` でプロジェクトルートを設定してください。",
             thread_ts=thread_ts,
         )
         return
@@ -2436,11 +2320,11 @@ def _help_text() -> str:
         "• `@bot cancel #2` → タスクをキャンセル\n"
         "• `@bot cancel all` → プロジェクト内全タスクをキャンセル\n"
         "*設定:*\n"
-        "• `@bot bind <path>` → チャンネルにプロジェクトルートを紐付け\n"
-        "• `@bot bind fork [PID]` → 実行中のclaude CLIプロセスをフォーク\n"
+        "• `@bot bind` → usage表示＋バインド可能なプロセスリスト\n"
+        "• `@bot bind -d <path>` → チャンネルにプロジェクトルートを紐付け\n"
+        "• `@bot bind -p <PID>` → 実行中のclaude CLIプロセスをフォーク\n"
         "• `@bot unbind` → プロジェクトルートの紐付けを解除\n"
-        "• (スレッド内) `tools <tool1,...>` → 次回の許可ツール設定\n"
-        "• `@bot detect` → 実行中のclaude CLIインスタンスを検出・接続"
+        "• (スレッド内) `tools <tool1,...>` → 次回の許可ツール設定"
     )
 
 
@@ -2520,18 +2404,134 @@ def _handle_cancel(text: str, say, thread_ts, channel_id: str):
         say(text=f"タスク #{task_id} は実行中ではありません", thread_ts=thread_ts)
 
 
-def _handle_bind(text: str, say, thread_ts, channel_id: str):
-    """チャンネルにプロジェクトルートを紐付け"""
-    dir_path = text[5:].strip()
-    expanded = os.path.abspath(os.path.expanduser(dir_path))
-    if not os.path.isdir(expanded):
-        say(text=f":warning: ディレクトリが見つかりません: `{dir_path}`", thread_ts=thread_ts)
+def _handle_bind(text: str, say, thread_ts, channel_id: str, user_id: str = ""):
+    """bind 統合ハンドラ: -d <path> / -p <PID> / 引数なし(usage+プロセスリスト)"""
+    rest = text[4:].strip()  # "bind" の後ろ
+
+    usage = (
+        "*使い方:*\n"
+        "• `bind -d <path>` — チャンネルにプロジェクトルートを紐付け\n"
+        "• `bind -p <PID>` — 実行中のclaude CLIプロセスをフォーク\n"
+        "• `bind` — この表示＋バインド可能なプロセスリスト\n"
+        "• `unbind` — 紐付けを解除"
+    )
+
+    # ── bind -d <path> ──
+    if rest.startswith("-d ") or rest.startswith("-d\t"):
+        dir_path = rest[3:].strip()
+        if not dir_path:
+            say(text=":warning: パスを指定してください: `bind -d <path>`", thread_ts=thread_ts)
+            return
+        expanded = os.path.abspath(os.path.expanduser(dir_path))
+        if not os.path.isdir(expanded):
+            say(text=f":warning: ディレクトリが見つかりません: `{dir_path}`", thread_ts=thread_ts)
+            return
+        runner.bind_project(channel_id, expanded)
+        say(
+            text=f":link: このチャンネルのプロジェクトルートを設定しました: `{expanded}`",
+            thread_ts=thread_ts,
+        )
         return
-    runner.bind_project(channel_id, expanded)
+
+    # ── bind -p [PID] ──
+    if rest == "-p" or rest.startswith("-p ") or rest.startswith("-p\t"):
+        pid_str = rest[2:].strip()
+        _handle_bind_process(pid_str, say, thread_ts, channel_id, user_id)
+        return
+
+    # ── bind（引数なし）→ usage + プロセスリスト（番号選択可） ──
+    if not rest:
+        _handle_bind_list(usage, say, thread_ts, channel_id, user_id)
+        return
+
+    # ── それ以外 → エラー + usage ──
     say(
-        text=f":link: このチャンネルのプロジェクトルートを設定しました: `{expanded}`",
+        text=f":warning: 不明な引数: `{rest}`\n\n{usage}",
         thread_ts=thread_ts,
     )
+
+
+def _handle_bind_process(pid_str: str, say, thread_ts, channel_id: str, user_id: str):
+    """bind -p のPID指定 / PID省略時のプロセスリスト表示"""
+    target_pid = None
+    if pid_str:
+        try:
+            target_pid = int(pid_str)
+        except ValueError:
+            say(text=":warning: PIDは数字で指定してください: `bind -p <PID>`", thread_ts=thread_ts)
+            return
+
+    # 実行中のclaude CLIプロセスを検出
+    instances = detect_running_claude_instances()
+    if not instances:
+        say(text=":mag: 実行中のclaude CLIインスタンスが見つかりません", thread_ts=thread_ts)
+        return
+
+    # 既に instance_threads で追跡中のPIDを除外
+    tracked_pids = {data["pid"] for data in instance_threads.values()}
+    candidates = [i for i in instances if i["pid"] not in tracked_pids]
+
+    if not candidates:
+        say(
+            text=f":mag: フォーク可能なインスタンスがありません（{len(tracked_pids)}件追跡中）",
+            thread_ts=thread_ts,
+        )
+        return
+
+    # PID指定あり → 直接実行
+    if target_pid is not None:
+        matched = [i for i in candidates if i["pid"] == target_pid]
+        if not matched:
+            if target_pid in tracked_pids:
+                say(text=f":warning: PID {target_pid} は既に追跡中です", thread_ts=thread_ts)
+            else:
+                say(text=f":warning: PID {target_pid} が見つかりません", thread_ts=thread_ts)
+            return
+        _execute_bind_fork(matched[0], channel_id, say, thread_ts, user_id)
+        return
+
+    # 1件 → 自動選択
+    if len(candidates) == 1:
+        _execute_bind_fork(candidates[0], channel_id, say, thread_ts, user_id)
+        return
+
+    # 複数件 → 番号リスト投稿 + pending_fork_selections に状態保存
+    lines = [":computer: *フォーク可能なclaude CLIインスタンス:*"]
+    for i, inst in enumerate(candidates, 1):
+        lines.append(f"  `{i}` — PID {inst['pid']}  :file_folder: `{inst['cwd']}`  :clock1: {inst['etime']}")
+    lines.append("\n番号を入力して選択、または `cancel` でキャンセル")
+    say(text="\n".join(lines), thread_ts=thread_ts)
+
+    pending_fork_selections[channel_id] = {
+        "instances": candidates,
+        "thread_ts": thread_ts,
+        "user_id": user_id,
+    }
+
+
+def _handle_bind_list(usage: str, say, thread_ts, channel_id: str, user_id: str):
+    """bind 引数なし: usage表示＋バインド可能なプロセスリスト"""
+    # プロセスリストを取得
+    instances = detect_running_claude_instances()
+    tracked_pids = {data["pid"] for data in instance_threads.values()}
+    candidates = [i for i in instances if i["pid"] not in tracked_pids] if instances else []
+
+    lines = [usage, ""]
+    if candidates:
+        lines.append(":computer: *フォーク可能なclaude CLIインスタンス:*")
+        for i, inst in enumerate(candidates, 1):
+            lines.append(f"  `{i}` — PID {inst['pid']}  :file_folder: `{inst['cwd']}`  :clock1: {inst['etime']}")
+        lines.append("\n番号を入力して選択、または `cancel` でキャンセル")
+
+        pending_fork_selections[channel_id] = {
+            "instances": candidates,
+            "thread_ts": thread_ts,
+            "user_id": user_id,
+        }
+    else:
+        lines.append(":mag: フォーク可能なclaude CLIインスタンスはありません")
+
+    say(text="\n".join(lines), thread_ts=thread_ts)
 
 
 def _handle_unbind(say, thread_ts, channel_id: str):
@@ -2560,7 +2560,7 @@ def _handle_in_dir(text: str, say, thread_ts, channel_id: str, user_id: str = ""
     project = runner.get_project(channel_id)
     if not project:
         say(
-            text=":warning: このチャンネルにはプロジェクトが設定されていません。\n`bind <path>` でプロジェクトルートを設定してください。",
+            text=":warning: このチャンネルにはプロジェクトが設定されていません。\n`bind -d <path>` でプロジェクトルートを設定してください。",
             thread_ts=thread_ts,
         )
         return
@@ -2643,107 +2643,6 @@ def _handle_sessions(say, thread_ts, channel_id: str):
     say(text="\n".join(lines), thread_ts=thread_ts)
 
 
-def _handle_detect(say, thread_ts):
-    """実行中のclaude CLIインスタンスを再検出"""
-    # 死んだインスタンスをクリーンアップ
-    dead = [ts for ts, data in instance_threads.items()
-            if not _is_process_alive(data["pid"])]
-    for ts in dead:
-        del instance_threads[ts]
-    if dead:
-        _save_instance_state()
-
-    instances = detect_running_claude_instances()
-    if not instances:
-        say(text=":mag: 実行中のclaude CLIインスタンスが見つかりません", thread_ts=thread_ts)
-        return
-
-    # 既に登録済みのPIDを除外
-    tracked_pids = {data["pid"] for data in instance_threads.values()}
-    new_instances = [i for i in instances if i["pid"] not in tracked_pids]
-
-    if not new_instances:
-        say(
-            text=f":mag: 新しいインスタンスはありません（{len(tracked_pids)}件追跡中）",
-            thread_ts=thread_ts,
-        )
-        return
-
-    registered = 0
-    for inst in new_instances:
-        try:
-            if _register_instance(inst):
-                registered += 1
-        except Exception as e:
-            logger.warning("インスタンス登録エラー: %s", e)
-
-    say(
-        text=f":mag: {registered}件の新しいclaude CLIインスタンスを検出・登録しました",
-        thread_ts=thread_ts,
-    )
-
-
-def _handle_bind_fork(text: str, say, thread_ts, channel_id: str, user_id: str):
-    """bind fork [PID] — 実行中のclaude CLIプロセスをこのチャンネルのProject+Sessionとしてフォーク"""
-    # "bind fork" の後の部分からPIDをパース
-    rest = text[len("bind fork"):].strip()
-    target_pid = None
-    if rest:
-        try:
-            target_pid = int(rest)
-        except ValueError:
-            say(text=":warning: PIDは数字で指定してください: `bind fork [PID]`", thread_ts=thread_ts)
-            return
-
-    # 実行中のclaude CLIプロセスを検出
-    instances = detect_running_claude_instances()
-    if not instances:
-        say(text=":mag: 実行中のclaude CLIインスタンスが見つかりません", thread_ts=thread_ts)
-        return
-
-    # 既に instance_threads で追跡中のPIDを除外
-    tracked_pids = {data["pid"] for data in instance_threads.values()}
-    candidates = [i for i in instances if i["pid"] not in tracked_pids]
-
-    if not candidates:
-        say(
-            text=f":mag: フォーク可能なインスタンスがありません（{len(tracked_pids)}件追跡中）",
-            thread_ts=thread_ts,
-        )
-        return
-
-    # PID指定あり → 直接実行
-    if target_pid is not None:
-        matched = [i for i in candidates if i["pid"] == target_pid]
-        if not matched:
-            # 追跡中のものも含めて確認
-            if target_pid in tracked_pids:
-                say(text=f":warning: PID {target_pid} は既に追跡中です", thread_ts=thread_ts)
-            else:
-                say(text=f":warning: PID {target_pid} が見つかりません", thread_ts=thread_ts)
-            return
-        _execute_bind_fork(matched[0], channel_id, say, thread_ts, user_id)
-        return
-
-    # 1件 → 自動選択
-    if len(candidates) == 1:
-        _execute_bind_fork(candidates[0], channel_id, say, thread_ts, user_id)
-        return
-
-    # 複数件 → 番号リスト投稿 + pending_fork_selections に状態保存
-    lines = [":computer: *フォーク可能なclaude CLIインスタンス:*"]
-    for i, inst in enumerate(candidates, 1):
-        lines.append(f"  `{i}` — PID {inst['pid']}  :file_folder: `{inst['cwd']}`  :clock1: {inst['etime']}")
-    lines.append("\n番号を入力して選択、または `cancel` でキャンセル")
-    say(text="\n".join(lines), thread_ts=thread_ts)
-
-    pending_fork_selections[channel_id] = {
-        "instances": candidates,
-        "thread_ts": thread_ts,
-        "user_id": user_id,
-    }
-
-
 def _execute_bind_fork(inst: dict, channel_id: str, say, thread_ts, user_id: str):
     """フォーク実行: Project+Session作成、instance_threads登録、監視開始"""
     pid = inst["pid"]
@@ -2756,7 +2655,7 @@ def _execute_bind_fork(inst: dict, channel_id: str, say, thread_ts, user_id: str
     try:
         resp = say(
             text=(
-                f":fork_and_knife: *bind fork* — PID {pid} をこのチャンネルにフォーク\n"
+                f":fork_and_knife: *bind -p* — PID {pid} をこのチャンネルにフォーク\n"
                 f":file_folder: `{cwd}`\n"
                 f":clock1: 経過: {inst.get('etime', '?')}\n"
                 f"_このスレッドに返信するとclaude CLIに入力を送信します_"
@@ -2811,10 +2710,7 @@ def _execute_bind_fork(inst: dict, channel_id: str, say, thread_ts, user_id: str
     )
     monitor.start()
 
-    # 7. 永続化
-    _save_instance_state()
-
-    # 8. 完了通知
+    # 7. 完了通知
     monitor_label = "JSONL" if jsonl_path else "Terminal"
     sid_info = f"\n_Session: `{session.claude_session_id[:12]}...`_" if session.claude_session_id else ""
     say(
@@ -2899,25 +2795,6 @@ def main():
             )
         except Exception as e:
             logger.warning("Slack起動通知の送信に失敗: %s", e)
-
-    # 保存された前回のインスタンス状態を読み込み（PID → thread_ts）
-    saved_pid_threads = _load_instance_state()
-    if saved_pid_threads:
-        logger.info("前回の状態: %d件のインスタンスが生存中", len(saved_pid_threads))
-
-    # 実行中のclaude CLIインスタンスを検出（NOTIFICATION_CHANNELがある場合のみSlack投稿）
-    instances = detect_running_claude_instances()
-    if instances:
-        logger.info("検出されたclaude CLIインスタンス: %d件", len(instances))
-        if NOTIFICATION_CHANNEL:
-            for inst in instances:
-                try:
-                    reuse_ts = saved_pid_threads.get(inst["pid"])
-                    _register_instance(inst, reuse_thread_ts=reuse_ts)
-                except Exception as e:
-                    logger.warning("インスタンス通知の送信に失敗: %s", e)
-    else:
-        logger.info("実行中のclaude CLIインスタンス: なし")
 
     handler = SocketModeHandler(app, SLACK_APP_TOKEN)
 
