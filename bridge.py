@@ -552,6 +552,8 @@ def _monitor_session_jsonl(inst: dict, thread_ts: str, dm_channel: str, client: 
         if text == last_posted_text:
             return  # 同一テキストの重複投稿を防止
         last_posted_text = text
+        # PTYペンディングメッセージを確定（JSONL経由で正式な応答が来たため）
+        _finalize_pty_pending(inst, dm_channel, client)
         display = text
         if len(display) > MAX_SLACK_MSG_LENGTH:
             display = "...\n" + display[-MAX_SLACK_MSG_LENGTH:]
@@ -565,6 +567,8 @@ def _monitor_session_jsonl(inst: dict, thread_ts: str, dm_channel: str, client: 
 
     def _post_question(text: str, metadata: dict | None):
         """AskUserQuestion の選択肢をスレッドに投稿し、pending_questionを設定。"""
+        # PTYペンディングメッセージを確定（JSONL経由で正式な質問が来たため）
+        _finalize_pty_pending(inst, dm_channel, client)
         try:
             client.chat_postMessage(
                 channel=dm_channel, thread_ts=thread_ts,
@@ -804,7 +808,8 @@ def _set_pty_size(fd: int, cols: int = 120, rows: int = 40):
 def _detect_permission_prompt(text: str) -> dict | None:
     """テキストから番号付き選択肢パターン（許可プロンプト等）を検出。
     検出時: {"description": str, "options": [{"label": str}, ...]} を返す。
-    未検出時: None"""
+    未検出時: None
+    複数行にまたがる選択肢テキスト（行折り返し）にも対応。"""
     lines = text.strip().split("\n")
 
     # 番号付き選択肢を探す（例: "1. Yes", "  2. No"）
@@ -813,6 +818,11 @@ def _detect_permission_prompt(text: str) -> dict | None:
 
     for i, line in enumerate(lines):
         stripped = line.strip()
+        if not stripped:
+            if option_lines:
+                break  # 空行で選択肢終了
+            continue
+
         m = re.match(r'^[>❯\s]*(\d+)\.\s+(.+)$', stripped)
         if m:
             num = int(m.group(1))
@@ -821,11 +831,13 @@ def _detect_permission_prompt(text: str) -> dict | None:
                 if not option_lines:
                     option_start_idx = i
                 option_lines.append({"label": label})
-            else:
-                option_lines = []
-                option_start_idx = -1
+            elif option_lines:
+                break  # 連番が崩れたので選択肢終了
         elif option_lines:
-            break  # 選択肢の終了
+            # 番号なし非空行 → 前の選択肢の折り返し継続行
+            if re.match(r'^[❯>]', stripped):
+                break  # プロンプト文字は選択肢終了
+            option_lines[-1]["label"] += " " + stripped
 
     if len(option_lines) < 2:
         return None
@@ -838,7 +850,7 @@ def _detect_permission_prompt(text: str) -> dict | None:
             if line:
                 desc_lines.append(line)
 
-    description = "\n".join(desc_lines) if desc_lines else "ツール実行の許可が必要です"
+    description = "\n".join(desc_lines) if desc_lines else "入力が必要です"
 
     return {
         "description": description,
@@ -852,7 +864,7 @@ def _post_permission_prompt(prompt_info: dict, thread_ts: str, channel_id: str,
     description = prompt_info["description"]
     options = prompt_info["options"]
 
-    lines = [":lock: *ツール実行の許可*", f"{description}"]
+    lines = [":question: *CLIからの質問*", f"{description}"]
     for i, opt in enumerate(options, 1):
         lines.append(f"  {i}. {opt['label']}")
     lines.append("_番号を返信してください（テキストでOther回答も可）_")
@@ -875,37 +887,125 @@ def _post_permission_prompt(prompt_info: dict, thread_ts: str, channel_id: str,
 
 def _monitor_pty_output(pid: int, master_fd: int, thread_ts: str, channel_id: str,
                         client: WebClient, inst: dict | None):
-    """PTYのmaster_fd出力を監視し、許可プロンプトを検出してSlackに投稿"""
+    """PTYのmaster_fd出力を監視し、idle検出でペンディング応答をSlackに投稿。
+    出力が一定時間停止した場合、バッファ内容をSlackスレッドに投稿する。
+    追加出力があればメッセージを上書き更新する。"""
     buf = b""
     MAX_BUF = 32 * 1024  # 32KBバッファ上限
+    IDLE_THRESHOLD = 3   # 連続idle回数（× 1秒）でペンディング投稿
+    idle_count = 0
+    buf_changed = False   # 前回投稿後にバッファに新データがあるか
 
     while _is_process_alive(pid):
         try:
             rlist, _, _ = select.select([master_fd], [], [], 1.0)
-            if not rlist:
-                continue
-            data = os.read(master_fd, 4096)
-            if not data:
-                break
-            buf += data
-            if len(buf) > MAX_BUF:
-                buf = buf[-MAX_BUF:]
         except OSError:
             break
 
-        # デコードして許可プロンプトを検出
-        try:
-            text = buf.decode("utf-8", errors="replace")
-        except Exception:
-            continue
+        if rlist:
+            try:
+                data = os.read(master_fd, 4096)
+                if not data:
+                    break
+                buf += data
+                if len(buf) > MAX_BUF:
+                    buf = buf[-MAX_BUF:]
+                idle_count = 0
+                buf_changed = True
+            except OSError:
+                break
+        else:
+            # select timeout — 出力なし
+            if not buf or not buf_changed:
+                continue
+            idle_count += 1
+            if idle_count >= IDLE_THRESHOLD:
+                _update_pty_pending(buf, inst, thread_ts, channel_id, client, pid)
+                buf_changed = False
+                idle_count = 0
 
-        clean = _strip_ansi(text)
-        prompt_info = _detect_permission_prompt(clean)
-        if prompt_info and inst is not None:
-            # 重複防止: pending_questionが既に設定されている場合はスキップ
-            if not inst.get("pending_question"):
-                _post_permission_prompt(prompt_info, thread_ts, channel_id, client, inst)
-                buf = b""  # 検出後バッファをリセット
+    # プロセス終了 → 未投稿データがあれば最終投稿、ペンディングメッセージを確定
+    if buf_changed and inst:
+        _update_pty_pending(buf, inst, thread_ts, channel_id, client, pid)
+    if inst:
+        _finalize_pty_pending(inst, channel_id, client)
+
+
+def _update_pty_pending(buf: bytes, inst: dict | None, thread_ts: str,
+                        channel_id: str, client: WebClient, pid: int):
+    """PTY idle検出時: バッファ内容を解析してSlackにペンディング応答として投稿/更新。
+    番号付き選択肢が検出された場合は質問形式で投稿し、pending_questionを設定する。
+    パターン不一致の場合はフィルタ済みコンテンツをそのまま表示する。
+    いずれも⏳インジケータ付きで、追加出力があれば上書き更新される。"""
+    if not inst:
+        return
+    if inst.get("pending_question"):
+        return  # 既に質問が投稿済み（JSONL経由等）
+
+    text = buf.decode("utf-8", errors="replace")
+    clean = _strip_ansi(text)
+    recent = "\n".join(clean.split("\n")[-30:])
+
+    # 番号付き選択肢パターンの検出
+    prompt_info = _detect_permission_prompt(recent)
+    if prompt_info:
+        description = prompt_info["description"]
+        options = prompt_info["options"]
+
+        parts = [":question: *CLIからの質問*", description]
+        for i, opt in enumerate(options, 1):
+            parts.append(f"  {i}. {opt['label']}")
+        parts.append("_番号を返信してください（テキストでOther回答も可）_")
+        display_content = "\n".join(parts)
+
+        # pending_question を設定（回答ルーティング用）
+        inst["pending_question"] = {
+            "options": options,
+            "multi_select": False,
+        }
+    else:
+        # パターン不一致 → フィルタ済みコンテンツをそのまま表示
+        filtered = _filter_terminal_ui(text).strip()
+        if not filtered:
+            return
+        display_content = filtered
+        if len(display_content) > MAX_SLACK_MSG_LENGTH:
+            display_content = "...\n" + display_content[-MAX_SLACK_MSG_LENGTH:]
+
+    # 確定前テキストを保存（finalize用）
+    inst["pty_pending_text"] = display_content
+
+    # ペンディングインジケータ付きで表示
+    display = f":hourglass: _CLIからの出力（確認中）_\n{display_content}"
+
+    pending_ts = inst.get("pty_pending_msg_ts")
+    try:
+        if pending_ts:
+            client.chat_update(
+                channel=channel_id, ts=pending_ts, text=display,
+            )
+        else:
+            resp = client.chat_postMessage(
+                channel=channel_id, thread_ts=thread_ts, text=display,
+            )
+            inst["pty_pending_msg_ts"] = resp["ts"]
+    except Exception as e:
+        logger.error("PTY pending投稿エラー PID %d: %s", pid, e)
+
+
+def _finalize_pty_pending(inst: dict, channel_id: str, client: WebClient):
+    """PTYのペンディングメッセージを確定（⏳インジケータ除去）。
+    JSONL経由で正式な応答が投稿された場合や、プロセス終了時に呼ばれる。"""
+    pending_ts = inst.pop("pty_pending_msg_ts", None)
+    pending_text = inst.pop("pty_pending_text", None)
+    if not pending_ts or not pending_text:
+        return
+    try:
+        client.chat_update(
+            channel=channel_id, ts=pending_ts, text=pending_text,
+        )
+    except Exception:
+        pass
 
 
 def _update_thinking_message(
@@ -1991,10 +2091,12 @@ def _handle_instance_input(text: str, say, parent_ts: str, channel_id: str):
                     action_label = f"Other: {text[:50]}"
 
                 inst.pop("pending_question", None)
+                _finalize_pty_pending(inst, channel_id, slack_client)
             else:
                 # 通常のテキスト入力
                 if pending_q and pending_q.get("multi_select", False):
                     inst.pop("pending_question", None)
+                    _finalize_pty_pending(inst, channel_id, slack_client)
                 os.write(master_fd, text.encode("utf-8") + b"\r")
 
             # Slack通知
@@ -2054,11 +2156,13 @@ def _handle_instance_input(text: str, say, parent_ts: str, channel_id: str):
 
             # pending_question をクリア
             inst.pop("pending_question", None)
+            _finalize_pty_pending(inst, channel_id, slack_client)
         else:
             # 通常のテキスト入力（既存動作）
             # multiSelectの場合もフォールバック
             if pending_q and pending_q.get("multi_select", False):
                 inst.pop("pending_question", None)
+                _finalize_pty_pending(inst, channel_id, slack_client)
 
             subprocess.run(
                 ["pbcopy"],
