@@ -5,22 +5,24 @@ Claude Code ⇔ Slack Bridge
 Mac上で動くClaude CodeをSlackから操作するブリッジ。
 複数タスクの同時実行に対応。チャンネルモードのみ（@bot メンション必須）。
 
-チャンネルとプロジェクトルートを紐付けることで、ユーザーはホストマシンの
-ディレクトリ構造を意識せず、チャンネル内で相対パスだけで操作可能。
+3層データモデル:
+  Project (= Slack Channel) — bind でプロジェクトルートを設定
+  Session (= Slack Thread)  — Project 内で並列。タスクの直列チェーン
+  Task    (= 指示→完了)     — Session 内で直列。スレッド返信で自動 --resume
 
 コマンド:
-  <タスク内容>              → 新しいタスクを実行
-  in <path> <タスク>        → 指定ディレクトリでタスクを実行（相対パスはプロジェクトルート基準）
-  continue [#id] <指示>     → セッションを続行（#id省略で直前タスク）
-  status                    → 全タスクの状態一覧
+  <タスク内容>              → 新しいセッション＋タスクを実行（bind必須）
+  (スレッド返信) <指示>     → 同セッションで --resume 続行
+  in <path> <タスク>        → 指定ディレクトリでセッション作成＋タスクを実行
+  status                    → プロジェクト内タスクの状態一覧
+  sessions                  → プロジェクト内セッション一覧
   cancel #id                → タスクをキャンセル
-  cancel all                → 全タスクをキャンセル
+  cancel all                → プロジェクト内全タスクをキャンセル
   bind <path>               → チャンネルにプロジェクトルートを紐付け
   unbind                    → プロジェクトルートの紐付けを解除
-  tools <list>              → 次回タスクの許可ツール設定
-  sessions                  → セッション履歴
-  resume <session_id> <指示> → 指定セッションを再開
+  tools <list>              → 次回タスクの許可ツール設定（スレッド内のみ）
   detect                    → 実行中のclaude CLIインスタンスを検出・接続
+  help                      → ヘルプ表示
 """
 
 import fcntl
@@ -79,36 +81,6 @@ MAX_SLACK_MSG_LENGTH = 3000
 INSTANCE_STATE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".instance_state.json")
 CHANNEL_PROJECTS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "channel_projects.json")
 
-# チャンネル→プロジェクトルート紐付け（channel_id → 絶対パス）
-_channel_projects: dict[str, str] = {}
-
-
-def _load_channel_projects():
-    """channel_projects.json からチャンネル→プロジェクトルート紐付けを読み込み"""
-    global _channel_projects
-    try:
-        with open(CHANNEL_PROJECTS_FILE, "r") as f:
-            _channel_projects = json.load(f)
-    except (FileNotFoundError, json.JSONDecodeError):
-        _channel_projects = {}
-    except Exception as e:
-        logger.warning("チャンネルプロジェクト設定の読み込みに失敗: %s", e)
-        _channel_projects = {}
-
-
-def _save_channel_projects():
-    """チャンネル→プロジェクトルート紐付けをファイルに永続化"""
-    try:
-        with open(CHANNEL_PROJECTS_FILE, "w") as f:
-            json.dump(_channel_projects, f, ensure_ascii=False, indent=2)
-    except Exception as e:
-        logger.warning("チャンネルプロジェクト設定の保存に失敗: %s", e)
-
-
-def _get_channel_project_root(channel_id: str) -> str | None:
-    """チャンネルに紐付けられたプロジェクトルートを返す。未設定ならNone"""
-    return _channel_projects.get(channel_id)
-
 
 def _is_user_allowed(user_id: str) -> bool:
     """ユーザーが操作を許可されているか（チャンネルモード用）"""
@@ -137,7 +109,7 @@ TASK_LABELS = [
 ]
 
 
-# ── データ構造 ────────────────────────────────────────────
+# ── データ構造（3層モデル: Project → Session → Task） ────
 class TaskStatus(Enum):
     QUEUED = "queued"
     RUNNING = "running"
@@ -148,42 +120,59 @@ class TaskStatus(Enum):
 
 @dataclass
 class Task:
+    """1回のClaude Code呼び出し。Session内で直列実行される。"""
     id: int
     prompt: str
-    channel_id: str = ""  # DMチャンネルID
-    label_emoji: str = ""
-    label_name: str = ""
     status: TaskStatus = TaskStatus.QUEUED
-    session_id: Optional[str] = None
-    thread_ts: Optional[str] = None
-    process: Optional[subprocess.Popen] = None
     result: Optional[str] = None
+    error: Optional[str] = None
     started_at: Optional[datetime] = None
     completed_at: Optional[datetime] = None
-    resume_session: Optional[str] = None
-    continue_last: bool = False
-    continue_session_id: Optional[str] = None
-    allowed_tools: Optional[str] = None
-    working_dir: Optional[str] = None
     tool_calls: list = field(default_factory=list)
-    error: Optional[str] = None
+    allowed_tools: Optional[str] = None
+    user_id: Optional[str] = None
+
+    # プロセス管理（実行中のみ）
+    process: Optional[subprocess.Popen] = None
     master_fd: Optional[int] = None
-    user_id: Optional[str] = None  # タスク実行者のSlack User ID
+
+    # セッション継続（Session.claude_session_id から自動設定）
+    resume_session: Optional[str] = None
 
     @property
     def short_id(self) -> str:
         return f"#{self.id}"
 
+
+@dataclass
+class Session:
+    """Slackスレッド = 1セッション。Project内で並列、タスクは直列チェーン。"""
+    thread_ts: str                    # Slackスレッド親ts = 識別子
+    channel_id: str                   # 所属チャンネル
+    claude_session_id: Optional[str] = None  # Claude CLIのsession_id
+    label_emoji: str = ""
+    label_name: str = ""
+    working_dir: Optional[str] = None  # in コマンドによるオーバーライド
+    created_at: Optional[datetime] = None
+    tasks: list[Task] = field(default_factory=list)
+    next_tools: Optional[str] = None  # tools コマンドで設定、次タスク実行時に消費
+
+    @property
+    def active_task(self) -> Optional[Task]:
+        """実行中のタスクを返す"""
+        for t in self.tasks:
+            if t.status in (TaskStatus.QUEUED, TaskStatus.RUNNING):
+                return t
+        return None
+
+    @property
+    def latest_task(self) -> Optional[Task]:
+        """最後のタスクを返す"""
+        return self.tasks[-1] if self.tasks else None
+
     @property
     def display_label(self) -> str:
-        return f"{self.label_emoji} {self.short_id}"
-
-
-# ── ユーザー設定（モジュールレベル） ──────────────────────
-@dataclass
-class UserSettings:
-    """個別設定（揮発性：Bridge再起動でリセット）"""
-    next_tools: Optional[str] = None
+        return f"{self.label_emoji} {self.label_name}" if self.label_name else self.label_emoji
 
     def consume_tools(self) -> Optional[str]:
         """next_tools を取り出してリセット"""
@@ -192,9 +181,66 @@ class UserSettings:
         return tools
 
 
-def _get_working_dir_for_channel(channel_id: str) -> str:
-    """チャンネルに紐付けられたプロジェクトルート、またはデフォルト作業ディレクトリを返す"""
-    return _get_channel_project_root(channel_id) or WORKING_DIR
+@dataclass
+class Project:
+    """Slackチャンネル = 1プロジェクト。bind で作成、ルートディレクトリ必須。"""
+    channel_id: str                   # Slackチャンネル = 識別子
+    root_dir: str                     # プロジェクトルート（絶対パス、必須）
+    sessions: dict[str, Session] = field(default_factory=dict)
+
+    def assign_label(self, session: Session):
+        """ラベル割り当て（プロジェクトスコープ：アクティブセッション間で重複なし）"""
+        used = set()
+        for s in self.sessions.values():
+            if s.active_task and s.label_name:
+                used.add(s.label_name)
+        for emoji, name in TASK_LABELS:
+            if name not in used:
+                session.label_emoji = emoji
+                session.label_name = name
+                return
+        session.label_emoji = "⚪"
+        session.label_name = f"session-{session.thread_ts[:8]}"
+
+    def get_or_create_session(self, thread_ts: str) -> Session:
+        """既存セッションを返すか、新規作成する"""
+        if thread_ts not in self.sessions:
+            session = Session(
+                thread_ts=thread_ts,
+                channel_id=self.channel_id,
+                created_at=datetime.now(),
+            )
+            self.assign_label(session)
+            self.sessions[thread_ts] = session
+        return self.sessions[thread_ts]
+
+    def find_task_by_id(self, task_id: int) -> Optional[tuple["Session", Task]]:
+        """タスクIDからセッションとタスクを検索"""
+        for session in self.sessions.values():
+            for task in session.tasks:
+                if task.id == task_id:
+                    return (session, task)
+        return None
+
+    def find_session_by_claude_id(self, claude_session_id: str) -> Optional["Session"]:
+        """Claude CLIのsession_idからセッションを検索（部分一致対応）"""
+        for session in self.sessions.values():
+            if session.claude_session_id and session.claude_session_id.startswith(claude_session_id):
+                return session
+        return None
+
+    @property
+    def active_sessions(self) -> list["Session"]:
+        """アクティブタスクを持つセッション一覧"""
+        return [s for s in self.sessions.values() if s.active_task]
+
+    @property
+    def all_tasks(self) -> list[Task]:
+        """全タスク一覧"""
+        tasks = []
+        for session in self.sessions.values():
+            tasks.extend(session.tasks)
+        return tasks
 
 
 # ── 実行中のclaude CLIプロセス検出 ───────────────────────
@@ -514,15 +560,17 @@ def _monitor_session_jsonl(inst: dict, thread_ts: str, channel: str, client: Web
         """エントリからtask情報（session_id, result, tool_calls）を抽出"""
         if not task_ref:
             return
+        session_ref = inst.get("session")  # Session オブジェクト参照
         entry_type = entry.get("type", "")
         msg = entry.get("message", {})
-        # session_id
+        # session_id → Task と Session 両方に設定
         if isinstance(msg, dict):
             sid = msg.get("session_id") or entry.get("session_id")
         else:
             sid = entry.get("session_id")
         if sid:
-            task_ref.session_id = sid
+            if session_ref:
+                session_ref.claude_session_id = sid
         # result type
         if entry_type == "result":
             result_data = entry.get("result", {})
@@ -732,8 +780,9 @@ def _monitor_session_jsonl(inst: dict, thread_ts: str, channel: str, client: Web
             pass
 
 
-def _extract_session_info_from_jsonl(task, jsonl_path: str):
-    """JONLファイルからsession_idとresultを抽出（フォールバック用）"""
+def _extract_session_info_from_jsonl(task: Task, session: Optional["Session"], jsonl_path: str):
+    """JONLファイルからsession_idとresultを抽出（フォールバック用）。
+    session が指定されていれば claude_session_id も更新する。"""
     try:
         with open(jsonl_path, "r", encoding="utf-8") as f:
             for line in f:
@@ -752,7 +801,8 @@ def _extract_session_info_from_jsonl(task, jsonl_path: str):
                 else:
                     sid = entry.get("session_id")
                 if sid:
-                    task.session_id = sid
+                    if session:
+                        session.claude_session_id = sid
                 # result
                 if entry_type == "result":
                     result_data = entry.get("result", {})
@@ -1372,55 +1422,74 @@ def _monitor_terminal_output(inst: dict, thread_ts: str, channel: str, client: W
 
 # ── Claude Code ランナー ──────────────────────────────────
 class ClaudeCodeRunner:
-    """複数のClaude Codeタスクを並行管理"""
+    """Project → Session → Task の3層構造でClaude Codeタスクを管理"""
 
     def __init__(self, slack_client: WebClient):
         self.client = slack_client
-        self.active_tasks: dict[int, Task] = {}
-        self.task_history: list[Task] = []
+        self.projects: dict[str, Project] = {}  # channel_id → Project
         self.lock = threading.Lock()
         self._task_counter = 0
-
-    @property
-    def active_count(self) -> int:
-        return len(self.active_tasks)
 
     def _next_id(self) -> int:
         self._task_counter += 1
         return self._task_counter
 
-    def _assign_label(self, task: Task):
-        used = {t.label_name for t in self.active_tasks.values()}
-        for emoji, name in TASK_LABELS:
-            if name not in used:
-                task.label_emoji = emoji
-                task.label_name = name
-                return
-        task.label_emoji = "⚪"
-        task.label_name = f"task-{task.id}"
+    # ── プロジェクト管理 ──
+    def bind_project(self, channel_id: str, root_dir: str) -> Project:
+        """チャンネルにプロジェクトルートを紐付け"""
+        if channel_id in self.projects:
+            self.projects[channel_id].root_dir = root_dir
+        else:
+            self.projects[channel_id] = Project(channel_id=channel_id, root_dir=root_dir)
+        self.save_projects()
+        return self.projects[channel_id]
 
-    def get_last_completed_task(self) -> Optional[Task]:
-        """直近完了タスク（session_id付き）を返す"""
-        for task in reversed(self.task_history):
-            if task.session_id:
-                return task
+    def unbind_project(self, channel_id: str) -> Optional[str]:
+        """プロジェクトルートの紐付けを解除。旧パスを返す。"""
+        project = self.projects.pop(channel_id, None)
+        if project:
+            self.save_projects()
+            return project.root_dir
         return None
 
-    def find_task_by_id(self, task_id: int) -> Optional[Task]:
-        if task_id in self.active_tasks:
-            return self.active_tasks[task_id]
-        for t in reversed(self.task_history):
-            if t.id == task_id:
-                return t
+    def get_project(self, channel_id: str) -> Optional[Project]:
+        return self.projects.get(channel_id)
+
+    def save_projects(self):
+        """Project の channel_id→root_dir のみ永続化（channel_projects.json 形式）"""
+        data = {p.channel_id: p.root_dir for p in self.projects.values()}
+        try:
+            with open(CHANNEL_PROJECTS_FILE, "w") as f:
+                json.dump(data, f, ensure_ascii=False, indent=2)
+        except Exception as e:
+            logger.warning("チャンネルプロジェクト設定の保存に失敗: %s", e)
+
+    def load_projects(self):
+        """channel_projects.json からプロジェクトを読み込み"""
+        try:
+            with open(CHANNEL_PROJECTS_FILE, "r") as f:
+                data = json.load(f)
+            for channel_id, root_dir in data.items():
+                if channel_id not in self.projects:
+                    self.projects[channel_id] = Project(channel_id=channel_id, root_dir=root_dir)
+                else:
+                    self.projects[channel_id].root_dir = root_dir
+        except (FileNotFoundError, json.JSONDecodeError):
+            pass
+        except Exception as e:
+            logger.warning("チャンネルプロジェクト設定の読み込みに失敗: %s", e)
+
+    # ── タスク検索 ──
+    def find_task_globally(self, task_id: int) -> Optional[tuple[Project, Session, Task]]:
+        """全プロジェクトからタスクIDで検索"""
+        for project in self.projects.values():
+            result = project.find_task_by_id(task_id)
+            if result:
+                session, task = result
+                return (project, session, task)
         return None
 
-    def find_task_by_session(self, session_id: str) -> Optional[Task]:
-        """セッションIDからタスクを検索（部分一致対応）"""
-        for t in reversed(self.task_history):
-            if t.session_id and t.session_id.startswith(session_id):
-                return t
-        return None
-
+    # ── コマンドビルド ──
     def build_command(self, task: Task, prompt_as_arg: bool = False) -> list[str]:
         cmd = [CLAUDE_CMD, "-p"]
         cmd.append("--verbose")
@@ -1429,11 +1498,7 @@ class ClaudeCodeRunner:
         if tools:
             cmd.extend(["--allowedTools", tools])
 
-        if task.continue_last:
-            cmd.append("--continue")
-        elif task.continue_session_id:
-            cmd.extend(["--resume", task.continue_session_id])
-        elif task.resume_session:
+        if task.resume_session:
             cmd.extend(["--resume", task.resume_session])
 
         if prompt_as_arg:
@@ -1441,38 +1506,42 @@ class ClaudeCodeRunner:
 
         return cmd
 
-    def run_task(self, task: Task) -> Optional[str]:
+    # ── タスク実行 ──
+    def run_task(self, project: Project, session: Session, task: Task) -> Optional[str]:
         """タスク実行を開始。エラー時はメッセージ文字列を返す"""
         with self.lock:
             task.id = self._next_id()
-            if not task.label_emoji:
-                self._assign_label(task)
-            self.active_tasks[task.id] = task
+            session.tasks.append(task)
 
-        thread = threading.Thread(target=self._execute, args=(task,), daemon=True)
+        thread = threading.Thread(
+            target=self._execute, args=(project, session, task), daemon=True
+        )
         thread.start()
         return None
 
-    def _execute(self, task: Task):
-        cwd = task.working_dir or WORKING_DIR
+    def _execute(self, project: Project, session: Session, task: Task):
+        cwd = session.working_dir or project.root_dir
+        channel_id = session.channel_id
+        thread_ts = session.thread_ts
         task.status = TaskStatus.RUNNING
         task.started_at = datetime.now()
 
         dir_display = os.path.basename(cwd) or cwd
-        is_continuation = task.continue_session_id or task.continue_last or task.resume_session
+        display_label = f"{session.label_emoji} {task.short_id}"
+        is_resume = task.resume_session is not None
 
-        if is_continuation and task.thread_ts:
+        if is_resume:
             header = (
-                f"{task.display_label}  :arrow_forward: *セッション続行*\n"
+                f"{display_label}  :arrow_forward: *セッション続行*\n"
                 f"```{task.prompt[:500]}```"
             )
         else:
             header = (
-                f"{task.display_label}  *タスク開始*\n"
+                f"{display_label}  *タスク開始*\n"
                 f":file_folder: `{dir_display}`\n"
                 f"```{task.prompt[:500]}```"
             )
-        self._post_status(task, header)
+        self._post_to_session(session, header)
 
         # PTYモード判定: プロンプトが200KB以下ならCLI引数で渡しPTYを使用
         prompt_bytes = task.prompt.encode("utf-8")
@@ -1505,23 +1574,23 @@ class ClaudeCodeRunner:
                 task.master_fd = master_fd
 
                 # instance_threadsに登録（スレッド返信ルーティング有効化）
-                if task.thread_ts:
-                    inst = {
-                        "pid": proc.pid,
-                        "cwd": cwd,
-                        "master_fd": master_fd,
-                        "task": task,
-                        "display_prefix": task.display_label,
-                        "skip_exit_message": True,
-                    }
-                    instance_threads[task.thread_ts] = inst
-                    registered_thread_ts = task.thread_ts
+                inst = {
+                    "pid": proc.pid,
+                    "cwd": cwd,
+                    "master_fd": master_fd,
+                    "task": task,
+                    "session": session,
+                    "display_prefix": display_label,
+                    "skip_exit_message": True,
+                }
+                instance_threads[thread_ts] = inst
+                registered_thread_ts = thread_ts
 
                 # PTY出力監視スレッドを起動
                 pty_thread = threading.Thread(
                     target=_monitor_pty_output,
-                    args=(proc.pid, master_fd, task.thread_ts, task.channel_id,
-                          self.client, instance_threads.get(task.thread_ts)),
+                    args=(proc.pid, master_fd, thread_ts, channel_id,
+                          self.client, instance_threads.get(thread_ts)),
                     daemon=True,
                 )
                 pty_thread.start()
@@ -1542,9 +1611,8 @@ class ClaudeCodeRunner:
                 proc.stdin.close()
 
             # JONLファイルが現れるまでポーリング
-            # min_ctime で作成時刻をフィルタし、既存セッションのJONLを誤検出しない
             jsonl_path = None
-            for _ in range(30):  # 最大30秒待機
+            for _ in range(30):
                 if proc.poll() is not None:
                     break
                 found = _find_session_jsonl(cwd, min_ctime=start_time)
@@ -1557,80 +1625,83 @@ class ClaudeCodeRunner:
             jsonl_monitored = False
             if jsonl_path and proc.poll() is None:
                 if registered_thread_ts and registered_thread_ts in instance_threads:
-                    # PTYモード: 既に登録済みのinstにJSONLフィールドを追加
                     inst = instance_threads[registered_thread_ts]
                     inst["jsonl_path"] = jsonl_path
                     inst["fixed_jsonl"] = True
                     inst["start_from_beginning"] = True
                     inst["task"] = task
+                    inst["session"] = session
                 else:
                     inst = {
                         "pid": proc.pid,
                         "cwd": cwd,
                         "jsonl_path": jsonl_path,
-                        "display_prefix": task.display_label,
+                        "display_prefix": display_label,
                         "skip_exit_message": True,
                         "fixed_jsonl": True,
                         "start_from_beginning": True,
                         "task": task,
+                        "session": session,
                     }
-                _monitor_session_jsonl(inst, task.thread_ts, task.channel_id, self.client)
+                _monitor_session_jsonl(inst, thread_ts, channel_id, self.client)
                 jsonl_monitored = True
 
             proc.wait()
 
             if task.status == TaskStatus.CANCELLED:
-                self._post_status(task, f"{task.display_label}  :stop_sign: キャンセルされました")
+                self._post_to_session(session, f"{display_label}  :stop_sign: キャンセルされました")
                 return
 
             # JSONL からsession_idを取得できなかった場合のフォールバック
-            if not task.session_id:
+            if not session.claude_session_id:
                 fallback_path = jsonl_path or _find_session_jsonl(cwd, min_ctime=start_time)
                 if fallback_path:
-                    _extract_session_info_from_jsonl(task, fallback_path)
+                    _extract_session_info_from_jsonl(task, session, fallback_path)
 
             if proc.returncode == 0:
                 task.status = TaskStatus.COMPLETED
                 task.completed_at = datetime.now()
                 elapsed = (task.completed_at - task.started_at).total_seconds()
-                summary = self._format_result(task, elapsed, show_result=not jsonl_monitored)
-                self._post_status(task, summary)
+                summary = self._format_result(
+                    task, session, elapsed, show_result=not jsonl_monitored
+                )
+                self._post_to_session(session, summary)
             else:
                 stderr_raw = proc.stderr.read() if proc.stderr else ""
                 stderr_output = stderr_raw.decode("utf-8", errors="replace") if isinstance(stderr_raw, bytes) else stderr_raw
                 task.status = TaskStatus.FAILED
                 task.error = stderr_output
                 task.completed_at = datetime.now()
-                self._post_status(
-                    task,
-                    f"{task.display_label}  :x: 失敗 (exit {proc.returncode})\n```{stderr_output[:1000]}```",
+                self._post_to_session(
+                    session,
+                    f"{display_label}  :x: 失敗 (exit {proc.returncode})\n```{stderr_output[:1000]}```",
                 )
 
         except Exception as e:
             task.status = TaskStatus.FAILED
             task.error = str(e)
             task.completed_at = datetime.now()
-            self._post_status(task, f"{task.display_label}  :x: エラー: {e}")
+            self._post_to_session(session, f"{display_label}  :x: エラー: {e}")
 
         finally:
-            # master_fdクローズ
             if master_fd is not None:
                 try:
                     os.close(master_fd)
                 except OSError:
                     pass
                 task.master_fd = None
-            # instance_threads登録解除
             if registered_thread_ts:
                 instance_threads.pop(registered_thread_ts, None)
-            with self.lock:
-                self.active_tasks.pop(task.id, None)
-                self.task_history.append(task)
 
-    def _format_result(self, task: Task, elapsed: float, show_result: bool = True) -> str:
-        dir_name = os.path.basename(task.working_dir or WORKING_DIR)
+    def _format_result(self, task: Task, session: Session, elapsed: float,
+                       show_result: bool = True) -> str:
+        cwd = session.working_dir or session.channel_id
+        # project から root_dir を取得
+        project = self.projects.get(session.channel_id)
+        dir_name = os.path.basename(project.root_dir if project else cwd)
+        display_label = f"{session.label_emoji} {task.short_id}"
         user_info = f"  <@{task.user_id}>" if task.user_id else ""
-        parts = [f"{task.display_label}  :white_check_mark: *タスク完了* ({elapsed:.0f}秒)  :file_folder: `{dir_name}`{user_info}"]
+        parts = [f"{display_label}  :white_check_mark: *タスク完了* ({elapsed:.0f}秒)  :file_folder: `{dir_name}`{user_info}"]
         if task.tool_calls:
             tools_summary = ", ".join(f"`{t['name']}`" for t in task.tool_calls[:10])
             if len(task.tool_calls) > 10:
@@ -1641,27 +1712,36 @@ class ClaudeCodeRunner:
             if len(task.result) > MAX_SLACK_MSG_LENGTH:
                 result_text += "\n...(省略)"
             parts.append(f"\n{result_text}")
-        if task.session_id:
-            parts.append(f"\n_Session: `{task.session_id[:12]}...`_")
-            parts.append(f"_`continue {task.short_id} <指示>` で続行（自動的に `{dir_name}/` で実行）_")
+        if session.claude_session_id:
+            parts.append(f"\n_Session: `{session.claude_session_id[:12]}...`_")
+            parts.append(f"_このスレッドに返信すると自動で続行します_")
         return "\n".join(parts)
 
-    def _post_status(self, task: Task, text: str):
-        channel = task.channel_id
+    def _post_to_session(self, session: Session, text: str):
+        """セッション（スレッド）にメッセージを投稿"""
         try:
-            if task.thread_ts:
+            if session.thread_ts:
                 self.client.chat_postMessage(
-                    channel=channel, thread_ts=task.thread_ts, text=text
+                    channel=session.channel_id,
+                    thread_ts=session.thread_ts,
+                    text=text,
                 )
             else:
-                resp = self.client.chat_postMessage(channel=channel, text=text)
-                task.thread_ts = resp["ts"]
+                resp = self.client.chat_postMessage(
+                    channel=session.channel_id, text=text
+                )
+                session.thread_ts = resp["ts"]
         except Exception as e:
             logger.error("Slack投稿エラー: %s", e)
 
+    # ── キャンセル ──
     def cancel_task(self, task_id: int) -> bool:
-        task = self.active_tasks.get(task_id)
-        if not task or task.status != TaskStatus.RUNNING:
+        """グローバル検索でタスクをキャンセル"""
+        result = self.find_task_globally(task_id)
+        if not result:
+            return False
+        _, _, task = result
+        if task.status != TaskStatus.RUNNING:
             return False
         task.status = TaskStatus.CANCELLED
         if task.process:
@@ -1672,11 +1752,30 @@ class ClaudeCodeRunner:
                 task.process.kill()
         return True
 
-    def cancel_all(self) -> int:
+    def cancel_all_in_project(self, channel_id: str) -> int:
+        """プロジェクト内の全アクティブタスクをキャンセル"""
+        project = self.projects.get(channel_id)
+        if not project:
+            return 0
         cancelled = 0
-        for task_id in list(self.active_tasks.keys()):
-            if self.cancel_task(task_id):
+        for session in project.sessions.values():
+            active = session.active_task
+            if active and active.status == TaskStatus.RUNNING:
+                active.status = TaskStatus.CANCELLED
+                if active.process:
+                    try:
+                        active.process.terminate()
+                        active.process.wait(timeout=5)
+                    except subprocess.TimeoutExpired:
+                        active.process.kill()
                 cancelled += 1
+        return cancelled
+
+    def cancel_all(self) -> int:
+        """全プロジェクトの全タスクをキャンセル（シャットダウン用）"""
+        cancelled = 0
+        for channel_id in list(self.projects.keys()):
+            cancelled += self.cancel_all_in_project(channel_id)
         return cancelled
 
 
@@ -1704,7 +1803,6 @@ def _summarize_input(input_data: dict) -> str:
 app = App(token=SLACK_BOT_TOKEN)
 slack_client = WebClient(token=SLACK_BOT_TOKEN)
 runner = ClaudeCodeRunner(slack_client)
-settings = UserSettings()
 
 # スレッドts → インスタンス情報のマッピング（起動時に検出したclaude CLIプロセス用）
 instance_threads: dict[str, dict] = {}
@@ -1865,13 +1963,52 @@ def handle_message(event, say):
         if not text:
             return
 
-        # スレッド返信 → 追跡中スレッドならCLIに転送（メンション不要）
         parent_ts = event.get("thread_ts")
-        if parent_ts and parent_ts in instance_threads:
-            input_text = _strip_bot_mention(text)
-            # "!" プレフィックス: "!clear" → "/clear"
-            input_text = "/" + input_text[1:] if input_text.startswith("!") else input_text
-            _handle_instance_input(input_text, say, parent_ts, channel_id)
+
+        # スレッド返信の処理
+        if parent_ts:
+            # 1. instance_threads に登録あり & アクティブタスク実行中 → PTY に入力転送
+            if parent_ts in instance_threads:
+                input_text = _strip_bot_mention(text)
+                input_text = "/" + input_text[1:] if input_text.startswith("!") else input_text
+                _handle_instance_input(input_text, say, parent_ts, channel_id)
+                return
+
+            # 2. セッション存在 → --resume で新タスク自動作成（メンション不要）
+            project = runner.get_project(channel_id)
+            if project:
+                session = project.sessions.get(parent_ts)
+                if session:
+                    input_text = _strip_bot_mention(text)
+                    if not input_text:
+                        input_text = text  # メンションなくてもOK
+                    # コマンド判定（toolsコマンドはスレッド内で有効）
+                    cmd_lower = input_text.lower()
+                    if cmd_lower.startswith("tools "):
+                        tools = input_text[6:].strip()
+                        session.next_tools = tools
+                        say(
+                            text=f":wrench: このセッションの次のタスクの許可ツール: `{tools}`\n続けてタスクを送信してください",
+                            thread_ts=parent_ts,
+                        )
+                        return
+                    if cmd_lower.startswith("cancel"):
+                        _handle_cancel(input_text, say, parent_ts, channel_id)
+                        return
+                    if cmd_lower == "status":
+                        _handle_status(say, parent_ts, channel_id)
+                        return
+                    # 新タスクとして --resume 続行
+                    _handle_thread_reply_task(
+                        input_text, project, session, say, parent_ts, user_id
+                    )
+                    return
+
+            # フォールバック: メンション付きならコマンドとして処理
+            stripped = _strip_bot_mention(text)
+            if stripped != text:
+                # メンション付きスレッド返信 → コマンドとして処理
+                _dispatch_command(stripped, event, say)
             return
 
         # トップレベルメッセージ: botメンション必須
@@ -1883,6 +2020,24 @@ def handle_message(event, say):
             return
 
         _dispatch_command(text, event, say)
+
+
+def _handle_thread_reply_task(prompt: str, project: Project, session: Session,
+                              say, thread_ts: str, user_id: str):
+    """スレッド返信を --resume で新タスクとして実行"""
+    task = Task(
+        id=0,
+        prompt=prompt,
+        allowed_tools=session.consume_tools(),
+        user_id=user_id,
+    )
+    # セッションにclaude_session_idがあれば自動で --resume
+    if session.claude_session_id:
+        task.resume_session = session.claude_session_id
+
+    err = runner.run_task(project, session, task)
+    if err:
+        say(text=err, thread_ts=thread_ts)
 
 
 def _dispatch_command(text: str, event: dict, say):
@@ -1900,12 +2055,12 @@ def _dispatch_command(text: str, event: dict, say):
 
     # ── status ──
     if cmd_lower == "status":
-        _handle_status(say, thread_ts)
+        _handle_status(say, thread_ts, channel_id)
         return
 
     # ── cancel ──
     if cmd_lower.startswith("cancel"):
-        _handle_cancel(text, say, thread_ts)
+        _handle_cancel(text, say, thread_ts, channel_id)
         return
 
     # ── bind <path> ──
@@ -1920,7 +2075,7 @@ def _dispatch_command(text: str, event: dict, say):
 
     # ── sessions ──
     if cmd_lower == "sessions":
-        _handle_sessions(say, thread_ts)
+        _handle_sessions(say, thread_ts, channel_id)
         return
 
     # ── detect ──
@@ -1928,24 +2083,20 @@ def _dispatch_command(text: str, event: dict, say):
         _handle_detect(say, thread_ts)
         return
 
-    # ── tools <list> ──
+    # ── tools <list> （トップレベルではエラー） ──
     if cmd_lower.startswith("tools "):
-        tools = text[6:].strip()
-        settings.next_tools = tools
         say(
-            text=f":wrench: 次のタスクの許可ツール: `{tools}`\n続けてタスクを送信してください",
+            text=":warning: `tools` コマンドはスレッド内でのみ有効です。タスクのスレッドに返信してください。",
             thread_ts=thread_ts,
         )
         return
 
-    # ── continue [#id] <指示> ──
-    if cmd_lower.startswith("continue"):
-        _handle_continue(text, say, thread_ts, channel_id, user_id)
-        return
-
-    # ── resume <session_id> <指示> ──
-    if cmd_lower.startswith("resume "):
-        _handle_resume(text, say, thread_ts, channel_id, user_id)
+    # ── continue / resume （廃止） ──
+    if cmd_lower.startswith("continue") or cmd_lower.startswith("resume "):
+        say(
+            text=":warning: `continue` / `resume` は廃止されました。タスクのスレッドに返信すると自動で続行します。",
+            thread_ts=thread_ts,
+        )
         return
 
     # ── in <path> <タスク> ──
@@ -1953,16 +2104,23 @@ def _dispatch_command(text: str, event: dict, say):
         _handle_in_dir(text, say, thread_ts, channel_id, user_id)
         return
 
-    # ── 新規タスク ──
+    # ── 新規タスク（bind必須） ──
+    project = runner.get_project(channel_id)
+    if not project:
+        say(
+            text=":warning: このチャンネルにはプロジェクトが設定されていません。\n`bind <path>` でプロジェクトルートを設定してください。",
+            thread_ts=thread_ts,
+        )
+        return
+
+    session = project.get_or_create_session(thread_ts)
     task = Task(
         id=0,
         prompt=text,
-        channel_id=channel_id,
-        working_dir=_get_working_dir_for_channel(channel_id),
-        allowed_tools=settings.consume_tools(),
+        allowed_tools=session.consume_tools(),
         user_id=user_id,
     )
-    err = runner.run_task(task)
+    err = runner.run_task(project, session, task)
     if err:
         say(text=err, thread_ts=thread_ts)
 
@@ -2236,27 +2394,35 @@ def handle_mention(event, say):
 def _help_text() -> str:
     return (
         ":robot_face: *Claude Code Bridge* — 使い方:\n"
-        "• `@bot <タスク>` → 新しいタスクを実行\n"
-        "• `@bot in <path> <タスク>` → 指定ディレクトリで実行（相対パスはプロジェクトルート基準）\n"
-        "• `@bot continue <指示>` → 直前セッションを続行\n"
-        "• `@bot continue #2 <指示>` → 指定タスクのセッションを続行\n"
-        "• `@bot resume <session_id> <指示>` → 指定セッションを再開\n"
-        "• `@bot status` → 全タスクの状態一覧\n"
+        "*基本操作:*\n"
+        "• `@bot <タスク>` → 新しいセッション＋タスクを実行（bind必須）\n"
+        "• (スレッド返信) `<指示>` → 同セッションで自動続行（メンション不要）\n"
+        "• `@bot in <path> <タスク>` → 指定ディレクトリでセッション作成＋実行\n"
+        "*管理:*\n"
+        "• `@bot status` → プロジェクト内タスクの状態一覧\n"
+        "• `@bot sessions` → プロジェクト内セッション一覧\n"
         "• `@bot cancel #2` → タスクをキャンセル\n"
-        "• `@bot cancel all` → 全タスクをキャンセル\n"
+        "• `@bot cancel all` → プロジェクト内全タスクをキャンセル\n"
+        "*設定:*\n"
         "• `@bot bind <path>` → チャンネルにプロジェクトルートを紐付け\n"
         "• `@bot unbind` → プロジェクトルートの紐付けを解除\n"
-        "• `@bot tools <tool1,...>` → 次回の許可ツール設定\n"
-        "• `@bot sessions` → セッション履歴\n"
+        "• (スレッド内) `tools <tool1,...>` → 次回の許可ツール設定\n"
         "• `@bot detect` → 実行中のclaude CLIインスタンスを検出・接続"
     )
 
 
-def _handle_status(say, thread_ts):
-    """アクティブタスク一覧"""
-    active = runner.active_tasks
-    if not active:
-        recent = runner.task_history[-5:] if runner.task_history else []
+def _handle_status(say, thread_ts, channel_id: str):
+    """プロジェクトスコープのタスク状態一覧"""
+    project = runner.get_project(channel_id)
+    if not project:
+        say(text=":warning: このチャンネルにはプロジェクトが設定されていません", thread_ts=thread_ts)
+        return
+
+    active_sessions = project.active_sessions
+    if not active_sessions:
+        # 直近の完了タスクを表示
+        all_tasks = project.all_tasks
+        recent = [t for t in all_tasks if t.status in (TaskStatus.COMPLETED, TaskStatus.FAILED, TaskStatus.CANCELLED)][-5:]
         if recent:
             lines = [":zzz: 実行中のタスクはありません\n*直近の完了タスク:*"]
             for t in reversed(recent):
@@ -2270,17 +2436,19 @@ def _handle_status(say, thread_ts):
             say(text=":zzz: 実行中のタスクはありません", thread_ts=thread_ts)
         return
 
-    lines = [f":gear: *実行中のタスク ({len(active)}件)*"]
-    for task in active.values():
+    lines = [f":gear: *実行中のタスク ({len(active_sessions)}セッション)*  :file_folder: `{os.path.basename(project.root_dir)}`"]
+    for session in active_sessions:
+        task = session.active_task
+        if not task:
+            continue
         elapsed = (datetime.now() - task.started_at).total_seconds() if task.started_at else 0
-        dir_name = os.path.basename(task.working_dir or WORKING_DIR)
         prompt_preview = task.prompt[:50] + ("..." if len(task.prompt) > 50 else "")
         tool_count = len(task.tool_calls)
 
         user_info = f"  <@{task.user_id}>" if task.user_id else ""
         lines.append(
-            f"\n{task.display_label}"
-            f"  :file_folder: `{dir_name}` ({elapsed:.0f}秒, ツール{tool_count}回){user_info}\n"
+            f"\n{session.label_emoji} {task.short_id}"
+            f"  ({elapsed:.0f}秒, ツール{tool_count}回){user_info}\n"
             f"> {prompt_preview}"
         )
         if task.tool_calls:
@@ -2290,20 +2458,23 @@ def _handle_status(say, thread_ts):
     say(text="\n".join(lines), thread_ts=thread_ts)
 
 
-def _handle_cancel(text: str, say, thread_ts):
+def _handle_cancel(text: str, say, thread_ts, channel_id: str):
     arg = text[6:].strip().lower()
 
     if arg == "all":
-        count = runner.cancel_all()
+        count = runner.cancel_all_in_project(channel_id)
         say(text=f":stop_sign: {count}件のタスクをキャンセルしました", thread_ts=thread_ts)
         return
 
     task_id = parse_task_id(arg)
     if task_id is None:
-        # アクティブタスクが1つだけならそれをキャンセル
-        if len(runner.active_tasks) == 1:
-            task_id = next(iter(runner.active_tasks))
-        else:
+        # プロジェクト内のアクティブタスクが1つだけならそれをキャンセル
+        project = runner.get_project(channel_id)
+        if project:
+            active = project.active_sessions
+            if len(active) == 1 and active[0].active_task:
+                task_id = active[0].active_task.id
+        if task_id is None:
             say(
                 text=":warning: キャンセルするタスクを指定してください: `cancel #2` or `cancel all`",
                 thread_ts=thread_ts,
@@ -2323,8 +2494,7 @@ def _handle_bind(text: str, say, thread_ts, channel_id: str):
     if not os.path.isdir(expanded):
         say(text=f":warning: ディレクトリが見つかりません: `{dir_path}`", thread_ts=thread_ts)
         return
-    _channel_projects[channel_id] = expanded
-    _save_channel_projects()
+    runner.bind_project(channel_id, expanded)
     say(
         text=f":link: このチャンネルのプロジェクトルートを設定しました: `{expanded}`",
         thread_ts=thread_ts,
@@ -2333,105 +2503,14 @@ def _handle_bind(text: str, say, thread_ts, channel_id: str):
 
 def _handle_unbind(say, thread_ts, channel_id: str):
     """チャンネルのプロジェクトルート紐付けを解除"""
-    if channel_id in _channel_projects:
-        removed = _channel_projects.pop(channel_id)
-        _save_channel_projects()
+    removed = runner.unbind_project(channel_id)
+    if removed:
         say(
-            text=f":broken_chain: プロジェクトルートの紐付けを解除しました（旧: `{removed}`）\nデフォルト: `{WORKING_DIR}`",
+            text=f":broken_chain: プロジェクトルートの紐付けを解除しました（旧: `{removed}`）",
             thread_ts=thread_ts,
         )
     else:
         say(text=":warning: このチャンネルにはプロジェクトルートが設定されていません", thread_ts=thread_ts)
-
-
-def _handle_continue(text: str, say, thread_ts, channel_id: str, user_id: str = ""):
-    rest = text[8:].strip()
-    if not rest:
-        say(
-            text=":warning: 続行する指示を入力してください\n例: `continue テスト追加して` or `continue #2 修正して`",
-            thread_ts=thread_ts,
-        )
-        return
-
-    original_task: Optional[Task] = None
-    target_session = None
-    prompt = rest
-
-    m = re.match(r"#(\d+)\s+(.*)", rest, re.DOTALL)
-    if m:
-        task_id = int(m.group(1))
-        prompt = m.group(2).strip()
-        original_task = runner.find_task_by_id(task_id)
-        if original_task and original_task.session_id:
-            target_session = original_task.session_id
-        else:
-            say(text=f":warning: タスク #{task_id} のセッションが見つかりません", thread_ts=thread_ts)
-            return
-    else:
-        original_task = runner.get_last_completed_task()
-        if original_task:
-            target_session = original_task.session_id
-
-    if not prompt:
-        say(text=":warning: 続行する指示を入力してください", thread_ts=thread_ts)
-        return
-
-    # 元タスクの作業ディレクトリ・スレッド・ラベルを引き継ぐ
-    inherited_dir = original_task.working_dir if original_task else None
-    inherited_thread = original_task.thread_ts if original_task else None
-    inherited_emoji = original_task.label_emoji if original_task else ""
-    inherited_label = original_task.label_name if original_task else ""
-
-    task = Task(
-        id=0,
-        prompt=prompt,
-        channel_id=original_task.channel_id if original_task and original_task.channel_id else channel_id,
-        working_dir=inherited_dir or _get_working_dir_for_channel(channel_id),
-        allowed_tools=settings.consume_tools(),
-        thread_ts=inherited_thread,
-        label_emoji=inherited_emoji,
-        label_name=inherited_label,
-        user_id=user_id,
-    )
-    if target_session:
-        task.continue_session_id = target_session
-    else:
-        task.continue_last = True
-
-    err = runner.run_task(task)
-    if err:
-        say(text=err, thread_ts=thread_ts)
-
-
-def _handle_resume(text: str, say, thread_ts, channel_id: str, user_id: str = ""):
-    parts = text[7:].strip().split(maxsplit=1)
-    if len(parts) < 2:
-        say(text=":warning: 使い方: `resume <session_id> <指示>`", thread_ts=thread_ts)
-        return
-    session_id, prompt = parts
-
-    # 元タスクの作業ディレクトリ・スレッド・ラベルを引き継ぐ
-    original = runner.find_task_by_session(session_id)
-    inherited_dir = original.working_dir if original else None
-    inherited_thread = original.thread_ts if original else None
-    inherited_emoji = original.label_emoji if original else ""
-    inherited_label = original.label_name if original else ""
-
-    task = Task(
-        id=0,
-        prompt=prompt,
-        channel_id=original.channel_id if original and original.channel_id else channel_id,
-        resume_session=session_id,
-        working_dir=inherited_dir or _get_working_dir_for_channel(channel_id),
-        allowed_tools=settings.consume_tools(),
-        thread_ts=inherited_thread,
-        label_emoji=inherited_emoji,
-        label_name=inherited_label,
-        user_id=user_id,
-    )
-    err = runner.run_task(task)
-    if err:
-        say(text=err, thread_ts=thread_ts)
 
 
 def _handle_in_dir(text: str, say, thread_ts, channel_id: str, user_id: str = ""):
@@ -2444,9 +2523,19 @@ def _handle_in_dir(text: str, say, thread_ts, channel_id: str, user_id: str = ""
     dir_path, prompt = parts
     dir_path = os.path.expanduser(dir_path)
 
+    # プロジェクトルートが必要（相対パス解決に使用）
+    project = runner.get_project(channel_id)
+    if not project:
+        say(
+            text=":warning: このチャンネルにはプロジェクトが設定されていません。\n`bind <path>` でプロジェクトルートを設定してください。",
+            thread_ts=thread_ts,
+        )
+        return
+
+    root = project.root_dir
+
     # 相対パスをプロジェクトルート基準で解決
     if not os.path.isabs(dir_path):
-        root = _get_channel_project_root(channel_id) or WORKING_DIR
         dir_path = os.path.normpath(os.path.join(root, dir_path))
         # セキュリティ: 解決後パスがプロジェクトルート配下であることを検証
         if not dir_path.startswith(root):
@@ -2457,46 +2546,67 @@ def _handle_in_dir(text: str, say, thread_ts, channel_id: str, user_id: str = ""
         say(text=f":warning: ディレクトリが見つかりません: `{dir_path}`", thread_ts=thread_ts)
         return
 
+    # 新セッション作成（working_dir オーバーライド付き）
+    session = project.get_or_create_session(thread_ts)
+    session.working_dir = dir_path
+
     task = Task(
         id=0,
         prompt=prompt,
-        channel_id=channel_id,
-        working_dir=dir_path,
-        allowed_tools=settings.consume_tools(),
+        allowed_tools=session.consume_tools(),
         user_id=user_id,
     )
-    err = runner.run_task(task)
+    err = runner.run_task(project, session, task)
     if err:
         say(text=err, thread_ts=thread_ts)
 
 
-def _handle_sessions(say, thread_ts):
-    """セッション履歴を表示"""
-    if not runner.task_history:
+def _handle_sessions(say, thread_ts, channel_id: str):
+    """プロジェクトスコープのセッション一覧を表示"""
+    project = runner.get_project(channel_id)
+    if not project:
+        say(text=":warning: このチャンネルにはプロジェクトが設定されていません", thread_ts=thread_ts)
+        return
+
+    if not project.sessions:
         say(text="セッション履歴はまだありません", thread_ts=thread_ts)
         return
 
-    lines = [":clipboard: *セッション履歴*"]
-    for task in reversed(runner.task_history[-10:]):
-        status_emoji = {
-            TaskStatus.COMPLETED: ":white_check_mark:",
-            TaskStatus.FAILED: ":x:",
-            TaskStatus.CANCELLED: ":stop_sign:",
-        }.get(task.status, ":grey_question:")
+    lines = [f":clipboard: *セッション一覧*  :file_folder: `{os.path.basename(project.root_dir)}`"]
 
-        sid = task.session_id[:16] + "..." if task.session_id else "N/A"
-        prompt_preview = task.prompt[:50] + ("..." if len(task.prompt) > 50 else "")
-        dir_name = os.path.basename(task.working_dir or WORKING_DIR)
-        elapsed = ""
-        if task.started_at and task.completed_at:
-            secs = (task.completed_at - task.started_at).total_seconds()
-            elapsed = f" ({secs:.0f}秒)"
+    # 最新のセッション10件を表示
+    sessions = sorted(
+        project.sessions.values(),
+        key=lambda s: s.created_at or datetime.min,
+        reverse=True,
+    )[:10]
+
+    for session in sessions:
+        active = session.active_task
+        if active:
+            status_emoji = ":gear:"
+        elif session.latest_task:
+            status_emoji = {
+                TaskStatus.COMPLETED: ":white_check_mark:",
+                TaskStatus.FAILED: ":x:",
+                TaskStatus.CANCELLED: ":stop_sign:",
+            }.get(session.latest_task.status, ":grey_question:")
+        else:
+            status_emoji = ":grey_question:"
+
+        sid = session.claude_session_id[:16] + "..." if session.claude_session_id else "N/A"
+        task_count = len(session.tasks)
+        cwd = session.working_dir or project.root_dir
+        dir_name = os.path.basename(cwd)
+        latest = session.latest_task
+        prompt_preview = latest.prompt[:40] + ("..." if latest and len(latest.prompt) > 40 else "") if latest else ""
 
         lines.append(
-            f"{status_emoji} {task.short_id} `{sid}` :file_folder:`{dir_name}` {prompt_preview}{elapsed}"
+            f"{status_emoji} {session.label_emoji} `{sid}` ({task_count}タスク)"
+            f" :file_folder:`{dir_name}` {prompt_preview}"
         )
 
-    lines.append("\n_`continue #<id> <指示>` or `resume <session_id> <指示>` で再開_")
+    lines.append("\n_タスクのスレッドに返信すると自動で続行します_")
     say(text="\n".join(lines), thread_ts=thread_ts)
 
 
@@ -2554,10 +2664,10 @@ def main():
     logger.info("=" * 55)
     logger.info("Ctrl+C で終了")
 
-    # チャンネル→プロジェクトルート紐付けを読み込み
-    _load_channel_projects()
-    if _channel_projects:
-        logger.info("チャンネルプロジェクト紐付け: %d件", len(_channel_projects))
+    # プロジェクト設定を読み込み
+    runner.load_projects()
+    if runner.projects:
+        logger.info("チャンネルプロジェクト紐付け: %d件", len(runner.projects))
 
     # 起動通知
     if NOTIFICATION_CHANNEL:
