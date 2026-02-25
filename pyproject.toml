@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "claude-slack-bridge"
 version = "0.1.0"
-description = "Mac上で動くClaude CodeをSlack DMから監視・操作するブリッジ"
+description = "Slackからclaude CLIを操作するブリッジ（macOS）"
 readme = "README.md"
 license = "MIT"
 requires-python = ">=3.10"
@@ -13,7 +13,12 @@ dependencies = [
     "slack-bolt>=1.18.0",
     "slack-sdk>=3.27.0",
     "python-dotenv>=1.0.0",
+    "Pillow>=10.0.0",
 ]
 
 [project.scripts]
 claude-slack-bridge = "bridge:main"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]

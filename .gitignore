@@ -15,5 +15,8 @@ venv/
 # Channel project bindings
 channel_projects.json
 
+# macOS
+.DS_Store
+
 # Slack attachment cache
 .slack-attachments/
