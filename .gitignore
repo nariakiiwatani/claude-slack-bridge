@@ -15,6 +15,12 @@ venv/
 # Channel project bindings
 channel_projects.json
 
+# Directory history
+directory_history.json
+
+# Channel root directories
+channel_roots.json
+
 # macOS
 .DS_Store
 

@@ -14,8 +14,9 @@ Mac上で動くClaude CodeをSlackから操作するブリッジ。
   in <path> <タスク>        → 指定ディレクトリでタスクを実行
   fork <PID> [<タスク>]     → 実行中のclaude CLIプロセスをフォーク
   fork                      → フォーク可能なプロセス一覧
-  <タスク内容>              → ディレクトリ選択画面からタスクを実行
+  <タスク内容>              → ディレクトリ選択画面からタスクを実行（root設定時は即実行）
   (スレッド返信) <指示>     → 同セッションで --resume 続行
+  root [<path>|clear]       → チャンネルのルートディレクトリ設定/表示/解除
   status                    → タスクの状態一覧
   sessions                  → セッション一覧
   cancel #id                → タスクをキャンセル
@@ -87,6 +88,7 @@ DEFAULT_ALLOWED_TOOLS = os.getenv(
 MAX_SLACK_MSG_LENGTH = 3000
 MAX_SLACK_FILE_SIZE = 20 * 1024 * 1024  # 20MB
 DIRECTORY_HISTORY_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "directory_history.json")
+CHANNEL_ROOTS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "channel_roots.json")
 DIRECTORY_HISTORY_MAX = 10
 
 
@@ -543,7 +545,7 @@ class Session:
 class Project:
     """Slackチャンネル = 1プロジェクト。セッションのコンテナ。"""
     channel_id: str                   # Slackチャンネル = 識別子
-    root_dir: Optional[str] = None    # レガシー互換（未使用）
+    root_dir: Optional[str] = None    # チャンネルのルートディレクトリ（永続化あり）
     sessions: dict[str, Session] = field(default_factory=dict)
 
     def assign_label(self, session: Session):
@@ -1888,7 +1890,9 @@ class ClaudeCodeRunner:
     def get_or_create_project(self, channel_id: str) -> Project:
         """チャンネルのProjectを取得、なければ作成"""
         if channel_id not in self.projects:
-            self.projects[channel_id] = Project(channel_id=channel_id)
+            roots = self.load_channel_roots()
+            root_dir = roots.get(channel_id)
+            self.projects[channel_id] = Project(channel_id=channel_id, root_dir=root_dir)
         return self.projects[channel_id]
 
     def get_project(self, channel_id: str) -> Optional[Project]:
@@ -1924,6 +1928,38 @@ class ClaudeCodeRunner:
             pass
         except Exception as e:
             logger.warning("ディレクトリ履歴の読み込みに失敗: %s", e)
+
+    # ── チャンネルルートディレクトリ ──
+    def save_channel_roots(self):
+        """チャンネルルート設定を永続化"""
+        roots = {}
+        for channel_id, project in self.projects.items():
+            if project.root_dir:
+                roots[channel_id] = project.root_dir
+        try:
+            with open(CHANNEL_ROOTS_FILE, "w") as f:
+                json.dump(roots, f, ensure_ascii=False, indent=2)
+        except Exception as e:
+            logger.warning("チャンネルルートの保存に失敗: %s", e)
+
+    def load_channel_roots(self) -> dict[str, str]:
+        """チャンネルルート設定を読み込み"""
+        try:
+            with open(CHANNEL_ROOTS_FILE, "r") as f:
+                return json.load(f)
+        except (FileNotFoundError, json.JSONDecodeError):
+            return {}
+        except Exception as e:
+            logger.warning("チャンネルルートの読み込みに失敗: %s", e)
+            return {}
+
+    def get_channel_root(self, channel_id: str) -> Optional[str]:
+        """チャンネルのルートディレクトリを取得"""
+        project = self.projects.get(channel_id)
+        if project and project.root_dir:
+            return project.root_dir
+        roots = self.load_channel_roots()
+        return roots.get(channel_id)
 
     # ── タスク検索 ──
     def find_task_globally(self, task_id: int) -> Optional[tuple[Project, Session, Task]]:
@@ -2552,6 +2588,11 @@ def _dispatch_command(text: str, event: dict, say):
         )
         return
 
+    # ── root [<path>|clear] ──
+    if cmd_lower == "root" or cmd_lower.startswith("root "):
+        _handle_root(text, say, thread_ts, channel_id)
+        return
+
     # ── in <path> <タスク> ──
     if cmd_lower.startswith("in "):
         _handle_in_dir(text, say, thread_ts, channel_id, user_id, _resolve_event_files(event, channel_id))
@@ -2870,6 +2911,9 @@ def _help_text() -> str:
         "• `@bot cancel #2` → タスクをキャンセル\n"
         "• `@bot cancel all` → 全タスクをキャンセル\n"
         "*設定:*\n"
+        "• `@bot root <絶対パス>` → チャンネルのルートディレクトリを設定\n"
+        "• `@bot root` → 現在のルートディレクトリを表示\n"
+        "• `@bot root clear` → ルートディレクトリを解除\n"
         "• (スレッド内) `tools <tool1,...>` → 次回の許可ツール設定"
     )
 
@@ -2950,6 +2994,47 @@ def _handle_cancel(text: str, say, thread_ts, channel_id: str):
         say(text=f"タスク #{task_id} は実行中ではありません", thread_ts=thread_ts)
 
 
+def _handle_root(text: str, say, thread_ts: str, channel_id: str):
+    """root [<path>|clear] — チャンネルのルートディレクトリを設定/表示/解除"""
+    rest = text[4:].strip()
+
+    project = runner.get_or_create_project(channel_id)
+
+    if not rest:
+        # 現在のルートを表示
+        if project.root_dir:
+            say(text=f":file_folder: このチャンネルのルートディレクトリ: `{project.root_dir}`", thread_ts=thread_ts)
+        else:
+            say(text=":file_folder: このチャンネルにルートディレクトリは設定されていません\n`root <絶対パス>` で設定できます", thread_ts=thread_ts)
+        return
+
+    if rest == "clear":
+        # ルートを解除
+        if project.root_dir:
+            old = project.root_dir
+            project.root_dir = None
+            runner.save_channel_roots()
+            say(text=f":wastebasket: ルートディレクトリを解除しました（旧: `{old}`）", thread_ts=thread_ts)
+        else:
+            say(text=":file_folder: ルートディレクトリは設定されていません", thread_ts=thread_ts)
+        return
+
+    # パスを設定
+    dir_path = os.path.expanduser(rest)
+
+    if not os.path.isabs(dir_path):
+        say(text=f":warning: 絶対パスで指定してください: `{dir_path}`", thread_ts=thread_ts)
+        return
+
+    if not os.path.isdir(dir_path):
+        say(text=f":warning: ディレクトリが見つかりません: `{dir_path}`", thread_ts=thread_ts)
+        return
+
+    project.root_dir = dir_path
+    runner.save_channel_roots()
+    say(text=f":white_check_mark: ルートディレクトリを設定しました: `{dir_path}`\n以降 `@bot <タスク>` で即座に実行されます", thread_ts=thread_ts)
+
+
 def _start_task_in_dir(dir_path: str, prompt: str, say, thread_ts: str,
                        channel_id: str, user_id: str = "",
                        files: list[dict] | None = None):
@@ -2989,8 +3074,17 @@ def _handle_in_dir(text: str, say, thread_ts, channel_id: str, user_id: str = ""
     dir_path = os.path.expanduser(dir_path)
 
     if not os.path.isabs(dir_path):
-        say(text=f":warning: 絶対パスで指定してください: `{dir_path}`", thread_ts=thread_ts)
-        return
+        # ルートディレクトリが設定されていれば相対パスを解決
+        root = runner.get_channel_root(channel_id)
+        if root:
+            dir_path = os.path.normpath(os.path.join(root, dir_path))
+        else:
+            say(
+                text=f":warning: 絶対パスで指定してください: `{dir_path}`\n"
+                     "💡 `root <絶対パス>` でルートディレクトリを設定すると相対パスが使えます",
+                thread_ts=thread_ts,
+            )
+            return
 
     if not os.path.isdir(dir_path):
         say(text=f":warning: ディレクトリが見つかりません: `{dir_path}`", thread_ts=thread_ts)
@@ -3102,88 +3196,62 @@ def _handle_fork_list(say, thread_ts, channel_id: str, user_id: str):
 
 def _execute_fork(inst: dict, channel_id: str, say, thread_ts, user_id: str,
                   initial_input: str | None = None):
-    """フォーク実行: Project+Session作成、instance_threads登録、監視開始"""
+    """フォーク実行: Project+Session作成、session_id取得（ワンショットモード）"""
     pid = inst["pid"]
     cwd = inst["cwd"]
 
-    # 1. Project 取得/作成
-    project = runner.get_or_create_project(channel_id)
-
-    # 2. Slack にフォーク開始メッセージ投稿 → fork_thread_ts 取得
-    try:
-        resp = say(
-            text=(
-                f":fork_and_knife: *fork* — PID {pid} をフォーク\n"
-                f":file_folder: `{cwd}`\n"
-                f":clock1: 経過: {inst.get('etime', '?')}\n"
-                f"_このスレッドに返信するとclaude CLIに入力を送信します_"
-            ),
-            thread_ts=None,  # トップレベルメッセージとして投稿
-        )
-        fork_thread_ts = resp["ts"]
-    except Exception as e:
-        logger.error("フォーク開始メッセージの投稿に失敗: %s", e)
-        say(text=f":x: フォーク開始メッセージの投稿に失敗しました: {e}", thread_ts=thread_ts)
-        return
-
-    # 3. Session 作成 + working_dir 設定
-    session = project.get_or_create_session(fork_thread_ts)
-    session.working_dir = cwd
-    runner.record_directory(channel_id, cwd)
-
-    # 4. JSONL があれば session_id を抽出
+    # 1. JSONL から session_id を抽出（先に確認）
     jsonl_path = _find_session_jsonl(cwd)
+    session_id = None
     if jsonl_path:
         dummy_task = Task(id=0, prompt="(fork)")
-        _extract_session_info_from_jsonl(dummy_task, session, jsonl_path)
+        dummy_session = type("_S", (), {"claude_session_id": None})()
+        _extract_session_info_from_jsonl(dummy_task, dummy_session, jsonl_path)
+        session_id = dummy_session.claude_session_id
 
-    # 5. instance_threads に登録（session 参照付き、task なし）
-    thread_data = {
-        "pid": pid,
-        "tty": inst.get("tty", ""),
-        "cwd": cwd,
-        "session": session,
-    }
+    if not session_id:
+        say(
+            text=(
+                f":x: PID {pid} の session_id を取得できませんでした\n"
+                f":file_folder: `{cwd}`\n"
+                f"JSONLファイルが見つからないか、session_id が含まれていません"
+            ),
+            thread_ts=thread_ts,
+        )
+        return
 
-    if jsonl_path:
-        # JSONL監視モード
-        thread_data["jsonl_path"] = jsonl_path
-        monitor_target = _monitor_session_jsonl
-    else:
-        # ターミナル監視にフォールバック
-        tty_device = f"/dev/{inst.get('tty', '')}"
-        initial_content = _read_terminal_contents(tty_device) or ""
-        thread_data["passive_baseline_len"] = len(initial_content)
-        thread_data["passive_baseline_marker"] = initial_content[-500:] if len(initial_content) >= 500 else initial_content
-        monitor_target = _monitor_terminal_output
+    # 2. Project 取得/作成
+    project = runner.get_or_create_project(channel_id)
 
-    instance_threads[fork_thread_ts] = thread_data
+    # 3. Session 作成 + working_dir / claude_session_id 設定（元メッセージのスレッドを使用）
+    session = project.get_or_create_session(thread_ts)
+    session.working_dir = cwd
+    session.claude_session_id = session_id
+    runner.record_directory(channel_id, cwd)
 
-    # 6. 監視スレッド起動
-    monitor = threading.Thread(
-        target=monitor_target,
-        args=(thread_data, fork_thread_ts, channel_id, slack_client),
-        daemon=True,
-    )
-    monitor.start()
-
-    # 7. initial_input がある場合、PTYまたはクリップボード経由で送信
-    if initial_input:
-        # フォーク後に少し待ってから入力（プロセスの準備完了を待つ）
-        time.sleep(0.5)
-        _handle_instance_input(initial_input, say, fork_thread_ts, channel_id)
-
-    # 8. 完了通知
-    monitor_label = "JSONL" if jsonl_path else "Terminal"
-    sid_info = f"\n_Session: `{session.claude_session_id[:12]}...`_" if session.claude_session_id else ""
+    # 4. フォーク完了通知
+    sid_info = f"\n_Session: `{session_id[:12]}...`_"
     say(
         text=(
-            f":white_check_mark: PID {pid} をフォークしました\n"
-            f":file_folder: `{cwd}`\n"
-            f":mag: 監視: {monitor_label}{sid_info}"
+            f":fork_and_knife: PID {pid} の文脈を引き継ぎました\n"
+            f":file_folder: `{cwd}`{sid_info}\n"
+            f"_このスレッドに返信すると同じ文脈で新しいタスクを実行します_"
         ),
         thread_ts=thread_ts,
     )
+
+    # 5. initial_input がある場合、--resume 付きタスクとして実行
+    if initial_input:
+        task = Task(
+            id=0,
+            prompt=initial_input,
+            allowed_tools=session.consume_tools(),
+            user_id=user_id,
+        )
+        task.resume_session = session_id
+        err = runner.run_task(project, session, task)
+        if err:
+            say(text=err, thread_ts=thread_ts)
 
 
 def _handle_fork_selection(text: str, say, channel_id: str) -> bool:
@@ -3227,9 +3295,22 @@ def _handle_fork_selection(text: str, say, channel_id: str) -> bool:
 
 
 def _handle_bare_task(text: str, event: dict, say, channel_id: str, user_id: str):
-    """ベアタスク: フォーク候補 + ディレクトリ履歴を表示し選択を待つ"""
+    """ベアタスク: ルート設定時は即実行、なければフォーク候補 + ディレクトリ履歴を表示し選択を待つ"""
     thread_ts = event.get("ts")
     files = _resolve_event_files(event, channel_id)
+
+    # ルートディレクトリが設定されている場合は即実行
+    root = runner.get_channel_root(channel_id)
+    if root:
+        if not os.path.isdir(root):
+            say(
+                text=f":warning: ルートディレクトリが見つかりません: `{root}`\n"
+                     "`root <絶対パス>` で再設定するか `root clear` で解除してください",
+                thread_ts=thread_ts,
+            )
+            return
+        _start_task_in_dir(root, text, say, thread_ts, channel_id, user_id, files)
+        return
 
     # フォーク候補を収集
     instances = detect_running_claude_instances()
@@ -3356,8 +3437,10 @@ def main():
     logger.info("=" * 55)
     logger.info("Ctrl+C で終了")
 
-    # ディレクトリ履歴を読み込み
+    # ディレクトリ履歴・チャンネルルートを読み込み
     runner.load_directory_history()
+    channel_roots = runner.load_channel_roots()
+    logger.info("  Channel Roots:    %d件", len(channel_roots))
 
     # 起動通知
     if NOTIFICATION_CHANNEL:
