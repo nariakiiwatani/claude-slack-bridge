@@ -22,7 +22,7 @@ Configuration is in `.env` (copy from `.env.example`). Required: `SLACK_BOT_TOKE
 
 ## Architecture
 
-Everything is in a single file: `bridge.py`. No tests exist.
+Everything is in a single file: `bridge.py`. Tests are in `tests/`.
 
 ### Data Model (3-Layer Hierarchy)
 
@@ -64,4 +64,4 @@ Thread replies to a session's Slack thread automatically create new tasks with `
 
 ## Language
 
-The codebase, comments, Slack messages, and README are all in Japanese. Maintain Japanese for user-facing Slack messages and code comments.
+The codebase, comments, and Slack messages are in Japanese. Documentation (README, setup guide) is bilingual (English + Japanese). Maintain Japanese for user-facing Slack messages and code comments. Tests exist in `tests/`.
