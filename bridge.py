@@ -976,10 +976,11 @@ def _monitor_session_jsonl(inst: dict, thread_ts: str, channel: str, client: Web
         msg = entry.get("message", {})
         # session_id → Session に設定（task_ref がなくても実行）
         if isinstance(msg, dict):
-            sid = msg.get("session_id") or entry.get("session_id")
+            sid = msg.get("sessionId") or entry.get("sessionId")
         else:
-            sid = entry.get("session_id")
+            sid = entry.get("sessionId")
         if sid and session_ref:
+            logger.debug("JSONL監視: session_id取得 sid=%s thread=%s", sid[:16] if sid else None, thread_ts)
             session_ref.claude_session_id = sid
         if not task_ref:
             return
@@ -1207,11 +1208,11 @@ def _extract_session_info_from_jsonl(task: Task, session: Optional["Session"], j
                     continue
                 entry_type = entry.get("type", "")
                 msg = entry.get("message", {})
-                # session_id
+                # sessionId
                 if isinstance(msg, dict):
-                    sid = msg.get("session_id") or entry.get("session_id")
+                    sid = msg.get("sessionId") or entry.get("sessionId")
                 else:
-                    sid = entry.get("session_id")
+                    sid = entry.get("sessionId")
                 if sid:
                     if session:
                         session.claude_session_id = sid
@@ -2037,17 +2038,23 @@ class ClaudeCodeRunner:
 
             # JONLファイルが現れるまでポーリング
             jsonl_path = None
-            for _ in range(30):
+            for poll_i in range(30):
                 if proc.poll() is not None:
+                    logger.debug("_execute: JONLポーリング中にプロセス終了 pid=%d poll=%d thread=%s", proc.pid, poll_i, thread_ts)
                     break
                 found = _find_session_jsonl(cwd, min_ctime=start_time)
                 if found:
                     jsonl_path = found
+                    logger.debug("_execute: JONLファイル発見 path=%s poll=%d thread=%s", found, poll_i, thread_ts)
                     break
                 time.sleep(1)
+            else:
+                logger.warning("_execute: JONLファイルが30秒以内に見つからず pid=%d cwd=%s thread=%s", proc.pid, cwd, thread_ts)
 
             # JSONL監視（プロセスがまだ実行中の場合）
             jsonl_monitored = False
+            if jsonl_path and proc.poll() is not None:
+                logger.debug("_execute: JSONL発見済みだがプロセス既に終了 pid=%d jsonl=%s thread=%s", proc.pid, jsonl_path, thread_ts)
             if jsonl_path and proc.poll() is None:
                 if registered_thread_ts and registered_thread_ts in instance_threads:
                     inst = instance_threads[registered_thread_ts]
@@ -2080,8 +2087,19 @@ class ClaudeCodeRunner:
             # JSONL からsession_idを取得できなかった場合のフォールバック
             if not session.claude_session_id:
                 fallback_path = jsonl_path or _find_session_jsonl(cwd, min_ctime=start_time)
+                logger.debug("_execute: session_id未取得、フォールバック試行 fallback_path=%s jsonl_monitored=%s pid=%d thread=%s",
+                             fallback_path, jsonl_monitored, proc.pid, thread_ts)
                 if fallback_path:
                     _extract_session_info_from_jsonl(task, session, fallback_path)
+                    if session.claude_session_id:
+                        logger.debug("_execute: フォールバックでsession_id取得成功 sid=%s thread=%s",
+                                     session.claude_session_id[:16], thread_ts)
+                    else:
+                        logger.warning("_execute: フォールバックでもsession_id取得失敗 jsonl=%s thread=%s", fallback_path, thread_ts)
+                else:
+                    logger.warning("_execute: フォールバック用JONLファイルも見つからず pid=%d cwd=%s thread=%s", proc.pid, cwd, thread_ts)
+            else:
+                logger.debug("_execute: タスク完了時 session_id=%s thread=%s", session.claude_session_id[:16], thread_ts)
 
             if proc.returncode == 0:
                 task.status = TaskStatus.COMPLETED
@@ -2307,6 +2325,9 @@ def handle_message(event, say):
             if project:
                 session = project.sessions.get(parent_ts)
                 if session:
+                    logger.debug("スレッド返信: セッション発見 thread=%s claude_session_id=%s task数=%d active=%s",
+                                 parent_ts, session.claude_session_id[:16] if session.claude_session_id else "None",
+                                 len(session.tasks), session.active_task is not None)
                     input_text = _strip_bot_mention(text)
                     if not input_text:
                         input_text = text  # メンションなくてもOK
@@ -2337,7 +2358,12 @@ def handle_message(event, say):
             stripped = _strip_bot_mention(text)
             if stripped != text:
                 # メンション付きスレッド返信 → コマンドとして処理
+                logger.debug("スレッド返信: セッション未発見、メンション付きコマンドとして処理 thread=%s channel=%s project=%s",
+                             parent_ts, channel_id, project is not None)
                 _dispatch_command(stripped, event, say)
+            else:
+                logger.debug("スレッド返信: セッション未発見かつメンションなし、無視 thread=%s channel=%s project=%s",
+                             parent_ts, channel_id, project is not None)
             return
 
         # フォーク選択割り込み（メンション有無問わず、番号 or cancel のみ処理）
@@ -2410,10 +2436,14 @@ def _handle_thread_reply_task(prompt: str, project: Project, session: Session,
     # セッションにclaude_session_idがまだ設定されていない場合、短時間待機
     # （前タスクの_executeがJSONL処理中の可能性があるため）
     if not session.claude_session_id and session.tasks:
-        for _ in range(10):
+        logger.debug("_handle_thread_reply_task: session_id未設定、待機開始 thread=%s task数=%d", thread_ts, len(session.tasks))
+        for wait_i in range(10):
             time.sleep(0.3)
             if session.claude_session_id:
+                logger.debug("_handle_thread_reply_task: 待機中にsession_id取得 sid=%s wait=%.1fs", session.claude_session_id[:16], (wait_i+1)*0.3)
                 break
+        else:
+            logger.warning("_handle_thread_reply_task: 3秒待機してもsession_id取得できず thread=%s", thread_ts)
 
     task = Task(
         id=0,
@@ -2424,6 +2454,9 @@ def _handle_thread_reply_task(prompt: str, project: Project, session: Session,
     # セッションにclaude_session_idがあれば自動で --resume
     if session.claude_session_id:
         task.resume_session = session.claude_session_id
+        logger.debug("_handle_thread_reply_task: --resume付きでタスク作成 sid=%s thread=%s", session.claude_session_id[:16], thread_ts)
+    else:
+        logger.warning("_handle_thread_reply_task: session_idなし、--resumeなしで新規タスク実行 thread=%s", thread_ts)
 
     err = runner.run_task(project, session, task)
     if err:
