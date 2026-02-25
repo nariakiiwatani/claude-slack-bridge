@@ -136,6 +136,36 @@ class TestStripAnsi:
         result = bridge._strip_ansi("\x1b[1m\x1b[34mbold blue\x1b[0m")
         assert result == "bold blue"
 
+    def test_removes_private_mode_sequences(self):
+        """?付きのプライベートモードシーケンス（カーソル表示/非表示等）"""
+        result = bridge._strip_ansi("\x1b[?25hvisible\x1b[?25l")
+        assert result == "visible"
+
+    def test_removes_focus_tracking(self):
+        """フォーカストラッキング制御（\x1b[?1004l）"""
+        result = bridge._strip_ansi("text\x1b[?1004l\x1b[?2004l")
+        assert result == "text"
+
+    def test_removes_bracketed_paste(self):
+        """ブラケットペーストモード（~終端）"""
+        result = bridge._strip_ansi("\x1b[200~pasted text\x1b[201~")
+        assert result == "pasted text"
+
+    def test_removes_sgr_mouse_mode(self):
+        """SGRマウスモード（<付きシーケンス）"""
+        result = bridge._strip_ansi("\x1b[<u\x1b[?1004ltext")
+        assert result == "text"
+
+    def test_removes_combined_terminal_control(self):
+        """実際のターミナル出力末尾に現れる制御シーケンスの組み合わせ"""
+        result = bridge._strip_ansi("output\x1b[<u\x1b[?1004l\x1b[?2004l\x1b[?25h\x1b[?25h")
+        assert result == "output"
+
+    def test_removes_orphan_esc(self):
+        """未知のエスケープシーケンスの残留ESC文字"""
+        result = bridge._strip_ansi("text\x1bremainder")
+        assert result == "textremainder"
+
 
 # ── _filter_terminal_ui ──────────────────────────────────
 

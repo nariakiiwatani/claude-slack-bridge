@@ -1042,18 +1042,29 @@ def _monitor_session_jsonl(inst: dict, thread_ts: str, channel: str, client: Web
             _flush_status(final=True)
 
     def _post_text(text: str):
-        """応答テキストをステータスメッセージに追記。同一テキストの重複投稿を防止。"""
-        nonlocal last_posted_text
+        """応答テキストを独立したメッセージとして投稿。同一テキストの重複投稿を防止。"""
+        nonlocal last_posted_text, status_msg_ts, status_lines
         if text == last_posted_text:
             return  # 同一テキストの重複投稿を防止
         last_posted_text = text
         # JSONL経由で正式な応答が来たため、PTYペンディングメッセージを削除
         _finalize_pty_pending(inst, channel, client, delete=True)
+        # 思考過程メッセージを確定（⏳除去）
+        _finalize_status()
+        # 応答テキストを独立した新規メッセージとして投稿
         display = _md_to_slack(text)
         if len(display) > MAX_SLACK_MSG_LENGTH:
             display = "...\n" + display[-MAX_SLACK_MSG_LENGTH:]
-        status_lines.append(f":speech_balloon: {display_prefix}\n{display}")
-        _flush_status(final=True)
+        try:
+            client.chat_postMessage(
+                channel=channel, thread_ts=thread_ts,
+                text=f":speech_balloon: {display_prefix}\n{display}",
+            )
+        except Exception as e:
+            logger.error("JSONL応答投稿エラー PID %d: %s", pid, e)
+        # ステータスをリセット（後続の思考/ツール使用は新メッセージに）
+        status_msg_ts = None
+        status_lines = []
 
     def _post_question(text: str, metadata: dict | None):
         """AskUserQuestion の選択肢をスレッドに投稿し、pending_questionを設定。"""
@@ -1083,12 +1094,13 @@ def _monitor_session_jsonl(inst: dict, thread_ts: str, channel: str, client: Web
     while _is_process_alive(pid):
         time.sleep(TERMINAL_POLL_INTERVAL)
 
-        # 新しい入力があればステータスメッセージを入力メッセージに切り替え
+        # 新しい入力があればステータスをリセット（新しいメッセージ群を開始）
         if "input_msg_ts" in inst:
             _finalize_status()
-            status_msg_ts = inst.pop("input_msg_ts")
-            input_text = inst.pop("input_msg_text", "")
-            status_lines = [input_text] if input_text else []
+            inst.pop("input_msg_ts")
+            inst.pop("input_msg_text", "")
+            status_msg_ts = None
+            status_lines = []
 
         # JONLファイルが変わった可能性をチェック（外部インスタンス用）
         if not fixed_jsonl:
@@ -1141,8 +1153,11 @@ def _monitor_session_jsonl(inst: dict, thread_ts: str, channel: str, client: Web
                     has_status = False
                     # 選択肢をスレッドに投稿（質問は別メッセージ）
                     _post_question(text, metadata)
+                    # ステータスをリセット（回答後の思考は新メッセージに）
+                    status_msg_ts = None
+                    status_lines = []
 
-        # テキスト応答があれば追記
+        # テキスト応答があれば独立メッセージとして投稿
         if text_parts:
             _post_text("\n".join(text_parts))
         elif has_status:
@@ -1168,6 +1183,8 @@ def _monitor_session_jsonl(inst: dict, thread_ts: str, channel: str, client: Web
                         text_parts = []
                     _finalize_status()
                     _post_question(text, metadata)
+                    status_msg_ts = None
+                    status_lines = []
         if text_parts:
             _post_text("\n".join(text_parts))
 
@@ -1246,9 +1263,15 @@ def _extract_session_info_from_jsonl(task: Task, session: Optional["Session"], j
 
 def _strip_ansi(text: str) -> str:
     """ANSIエスケープシーケンスを除去"""
-    text = re.sub(r'\x1b\[[0-9;]*[a-zA-Z]', '', text)
+    # CSI sequences: ESC [ (parameter/intermediate bytes 0x20-0x3F)* (final byte 0x40-0x7E)
+    # 標準シーケンス(\x1b[0m等)とプライベートモード(\x1b[?25h, \x1b[<u等)を両方カバー
+    text = re.sub(r'\x1b\[[\x20-\x3f]*[\x40-\x7e]', '', text)
+    # OSC sequences: ESC ] ... (BEL or ST)
     text = re.sub(r'\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)', '', text)
+    # Character set selection: ESC ( / ESC )
     text = re.sub(r'\x1b[()][A-Z0-9]', '', text)
+    # 残りのESC文字を除去（未知のエスケープシーケンス対策）
+    text = text.replace('\x1b', '')
     return text
 
 
@@ -1421,11 +1444,12 @@ def _monitor_pty_output(pid: int, master_fd: int, thread_ts: str, channel_id: st
                 buf_changed = False
                 idle_count = 0
 
-    # プロセス終了 → 未投稿データがあれば最終投稿、ペンディングメッセージを確定
+    # プロセス終了 → JSONL監視中はPTYペンディングを削除、それ以外は確定
+    jsonl_active = bool(inst.get("jsonl_path")) if inst else False
     if buf_changed and inst:
         _update_pty_pending(buf, inst, thread_ts, channel_id, client, pid)
     if inst:
-        _finalize_pty_pending(inst, channel_id, client)
+        _finalize_pty_pending(inst, channel_id, client, delete=jsonl_active)
 
 
 def _update_pty_pending(buf: bytes, inst: dict | None, thread_ts: str,
@@ -1438,6 +1462,8 @@ def _update_pty_pending(buf: bytes, inst: dict | None, thread_ts: str,
         return
     if inst.get("pending_question"):
         return  # 既に質問が投稿済み（JSONL経由等）
+    if inst.get("jsonl_path"):
+        return  # JSONL監視中はPTYペンディング投稿をスキップ（重複防止）
 
     text = buf.decode("utf-8", errors="replace")
     clean = _strip_ansi(text)
@@ -1461,11 +1487,11 @@ def _update_pty_pending(buf: bytes, inst: dict | None, thread_ts: str,
             "multi_select": False,
         }
     else:
-        # パターン不一致 → フィルタ済みコンテンツをそのまま表示
+        # パターン不一致 → フィルタ済みコンテンツをSlack mrkdwnに変換して表示
         filtered = _filter_terminal_ui(text).strip()
         if not filtered:
             return
-        display_content = filtered
+        display_content = _md_to_slack(filtered)
         if len(display_content) > MAX_SLACK_MSG_LENGTH:
             display_content = "...\n" + display_content[-MAX_SLACK_MSG_LENGTH:]
 
