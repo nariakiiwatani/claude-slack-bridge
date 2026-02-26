@@ -50,6 +50,7 @@ from pathlib import Path
 from typing import Optional
 
 from dotenv import load_dotenv
+from i18n import t
 
 try:
     from PIL import Image as PILImage
@@ -123,30 +124,30 @@ def _download_slack_file_content(url: str, token: str) -> bytes | None:
         try:
             with _no_redirect_opener.open(req) as resp:
                 data = resp.read()
-                logger.info("Slackファイル取得: status=%d, url=%s", resp.status, url[:80])
+                logger.info("Slack file fetched: status=%d, url=%s", resp.status, url[:80])
                 # HTMLログインページが返された場合
                 if data[:15] == b"<!DOCTYPE html>" or data[:5] == b"<html":
-                    logger.error("Slackがファイルの代わりにHTMLを返却 (%d bytes)。"
-                                 "Bot tokenの files:read スコープを確認してください。", len(data))
+                    logger.error("Slack returned HTML instead of file (%d bytes). "
+                                 "Check bot token files:read scope.", len(data))
                     return None
                 return data
         except urllib.error.HTTPError as e:
             if e.code in (301, 302, 303, 307, 308):
                 new_url = e.headers.get("Location", "")
                 if not new_url:
-                    logger.warning("リダイレクトにLocationヘッダーなし")
+                    logger.warning("Redirect missing Location header")
                     return None
                 # 相対URLを絶対URLに変換
                 if new_url.startswith("/"):
                     parsed = urlparse(url)
                     new_url = f"{parsed.scheme}://{parsed.netloc}{new_url}"
-                logger.info("リダイレクト追跡 (%d): %s → %s", e.code, url[:60], new_url[:60])
+                logger.info("Following redirect (%d): %s -> %s", e.code, url[:60], new_url[:60])
                 url = new_url
                 continue
-            logger.warning("Slackファイルダウンロード: HTTP %d", e.code)
+            logger.warning("Slack file download: HTTP %d", e.code)
             return None
 
-    logger.warning("Slackファイルダウンロード: リダイレクト回数超過")
+    logger.warning("Slack file download: too many redirects")
     return None
 
 
@@ -173,9 +174,9 @@ def _normalize_image(path: str) -> str | None:
         try:
             with open(path, "rb") as f:
                 head = f.read(64)
-            logger.error("画像ファイルを開けない: %s (先頭bytes: %r)", path, head)
+            logger.error("Cannot open image file: %s (first bytes: %r)", path, head)
         except Exception:
-            logger.exception("画像ファイルを開けない（読み取りも失敗）: %s", path)
+            logger.exception("Cannot open image file (read also failed): %s", path)
         try:
             os.remove(path)
         except OSError:
@@ -216,11 +217,11 @@ def _normalize_image(path: str) -> str | None:
             except OSError:
                 pass
 
-        logger.info("画像を正規化: %s → %s (%dx%d, %s)",
+        logger.info("Image normalized: %s -> %s (%dx%d, %s)",
                     os.path.basename(path), os.path.basename(out_path), new_w, new_h, out_fmt)
         return out_path
     except Exception:
-        logger.exception("画像の変換に失敗: %s", path)
+        logger.exception("Image conversion failed: %s", path)
         img.close()
         return path  # 変換失敗時は元ファイルをそのまま試す
 
@@ -250,12 +251,12 @@ def _resolve_event_files(event: dict, channel_id: str = "") -> list[dict]:
 
     has_file_hints = file_ids or has_upload or subtype == "file_share"
     if has_file_hints:
-        logger.info("event.filesは空だがファイルの手がかりあり (subtype=%s, upload=%s, file_ids=%s, event_keys=%s)",
+        logger.info("event.files empty but file hints found (subtype=%s, upload=%s, file_ids=%s, event_keys=%s)",
                     subtype, has_upload, file_ids, sorted(event.keys()))
 
     # file_idがあればSlack APIでファイル情報を取得
     if file_ids:
-        logger.info("file_ids=%sからファイル情報を取得", file_ids)
+        logger.info("Fetching file info from file_ids=%s", file_ids)
         resolved = []
         for fid in file_ids:
             try:
@@ -263,7 +264,7 @@ def _resolve_event_files(event: dict, channel_id: str = "") -> list[dict]:
                 if resp.get("ok"):
                     resolved.append(resp["file"])
             except Exception:
-                logger.exception("files.info失敗: %s", fid)
+                logger.exception("files.info failed: %s", fid)
         if resolved:
             return resolved
 
@@ -282,15 +283,15 @@ def _resolve_event_files(event: dict, channel_id: str = "") -> list[dict]:
             if msgs:
                 refetched = msgs[0].get("files", [])
                 if refetched:
-                    logger.info("conversations.historyからfiles=%d件取得: %s",
+                    logger.info("Got %d files from conversations.history: %s",
                                 len(refetched),
                                 [(f.get("name"), f.get("mimetype")) for f in refetched])
                     return refetched
         except Exception:
-            logger.exception("conversations.historyでの再取得失敗")
+            logger.exception("conversations.history re-fetch failed")
 
     if has_file_hints:
-        logger.warning("ファイルの手がかりはあったが取得できず (event_keys=%s)", sorted(event.keys()))
+        logger.warning("File hints found but could not retrieve files (event_keys=%s)", sorted(event.keys()))
     return []
 
 
@@ -315,12 +316,12 @@ def _download_slack_files(files: list[dict], save_dir: str) -> list[str]:
     for f in files:
         size = f.get("size", 0)
         if size > MAX_SLACK_FILE_SIZE:
-            logger.warning("添付ファイルが大きすぎるためスキップ: %s (%d bytes)", f.get("name"), size)
+            logger.warning("Attachment too large, skipping: %s (%d bytes)", f.get("name"), size)
             continue
 
         url = f.get("url_private_download") or f.get("url_private")
         if not url:
-            logger.warning("添付ファイルにダウンロードURLなし: %s (keys=%s)", f.get("name"), list(f.keys()))
+            logger.warning("Attachment has no download URL: %s (keys=%s)", f.get("name"), list(f.keys()))
             continue
 
         # ファイル名のスペースをアンダースコアに置換（パス解釈の問題を防止）
@@ -330,7 +331,7 @@ def _download_slack_files(files: list[dict], save_dir: str) -> list[str]:
         try:
             data = _download_slack_file_content(url, SLACK_BOT_TOKEN)
             if data is None:
-                logger.warning("添付ファイルのダウンロードに失敗（無効なレスポンス）: %s", raw_name)
+                logger.warning("Attachment download failed (invalid response): %s", raw_name)
                 continue
             with open(dest, "wb") as out:
                 out.write(data)
@@ -340,21 +341,21 @@ def _download_slack_files(files: list[dict], save_dir: str) -> list[str]:
                 normalized = _normalize_image(dest)
                 if normalized:
                     paths.append(normalized)
-                    logger.info("添付画像を準備: %s", normalized)
+                    logger.info("Attachment image prepared: %s", normalized)
                 else:
-                    logger.warning("添付画像の正規化に失敗、スキップ: %s", raw_name)
+                    logger.warning("Attachment image normalization failed, skipping: %s", raw_name)
             else:
                 paths.append(dest)
-                logger.info("添付ファイルを準備: %s", dest)
+                logger.info("Attachment file prepared: %s", dest)
         except Exception:
-            logger.exception("添付ファイルのダウンロードに失敗: %s", raw_name)
+            logger.exception("Attachment download failed: %s", raw_name)
     return paths
 
 
 def _augment_prompt_with_files(prompt: str, file_paths: list[str]) -> str:
     """添付ファイルパスをプロンプト末尾に追記"""
     lines = "\n".join(file_paths)
-    return f"{prompt}\n\n添付ファイル:\n{lines}"
+    return f"{prompt}\n\n{t('prompt_attached_files')}\n{lines}"
 
 
 # ---------------------------------------------------------------------------
@@ -637,7 +638,7 @@ def detect_running_claude_instances() -> list[dict]:
                 "tty": tty,
             })
     except Exception as e:
-        logger.warning("claudeプロセス検出エラー: %s", e)
+        logger.warning("Claude process detection error: %s", e)
     return instances
 
 
@@ -786,7 +787,7 @@ def _classify_jsonl_entry(entry: dict) -> list[tuple[str, str, dict | None]]:
 
         if entry_type == "assistant" and c_type == "thinking":
             text = c.get("thinking", "")
-            results.append(("status", f":thought_balloon: _思考中..._ ({len(text)}文字)", None))
+            results.append(("status", t("status_thinking", chars=len(text)), None))
 
         elif entry_type == "assistant" and c_type == "text":
             text = c.get("text", "").strip()
@@ -855,9 +856,9 @@ def _format_ask_user_question(tool_input: dict) -> tuple[str, dict | None]:
             option_items.append({"label": label, "description": desc})
 
         if multi_select:
-            lines.append("_複数選択が必要ですが、現在は未対応です。テキストで回答してください。_")
+            lines.append(t("question_multi_select_unsupported"))
         else:
-            lines.append("_番号を返信してください（テキストでOther回答も可）_")
+            lines.append(t("question_reply_with_number"))
 
         all_parts.append("\n".join(lines))
         all_questions_meta.append({
@@ -893,25 +894,25 @@ def _format_exit_plan_mode(tool_input: dict) -> tuple[str, dict | None]:
                 if isinstance(p, dict):
                     prompt_lines.append(f"- `{p.get('tool', '?')}`: {p.get('prompt', '')}")
             if prompt_lines:
-                plan_text += "\n\n*許可プロンプト:*\n" + "\n".join(prompt_lines)
+                plan_text += "\n\n" + t("question_allowed_prompts") + "\n" + "\n".join(prompt_lines)
 
-    lines = [":clipboard: *プランの承認が必要です*"]
+    lines = [t("question_plan_approval_required")]
     if plan_text:
         # Slack表示用にプラン内容をコードブロックで表示（長い場合は切り詰め）
         display = plan_text
         max_plan_len = 2500  # 質問テキスト等のオーバーヘッドを考慮
         if len(display) > max_plan_len:
-            display = display[:max_plan_len] + "\n...(省略)"
+            display = display[:max_plan_len] + "\n" + t("question_plan_truncated")
         lines.append(f"```\n{display}\n```")
-    lines.append("  1. 承認して実行")
-    lines.append("  2. 却下・フィードバック")
-    lines.append("_番号を返信してください（テキストでフィードバックも可）_")
+    lines.append(f"  1. {t('question_approve_execute')}")
+    lines.append(f"  2. {t('question_reject_feedback')}")
+    lines.append(t("question_reply_with_feedback"))
 
     metadata = {
         "questions": [{
             "options": [
-                {"label": "承認して実行", "description": ""},
-                {"label": "却下・フィードバック", "description": ""},
+                {"label": t("question_approve_execute"), "description": ""},
+                {"label": t("question_reject_feedback"), "description": ""},
             ],
             "multi_select": False,
         }]
@@ -983,7 +984,7 @@ def _monitor_session_jsonl(inst: dict, thread_ts: str, channel: str, client: Web
         else:
             sid = entry.get("sessionId")
         if sid and session_ref:
-            logger.debug("JSONL監視: session_id取得 sid=%s thread=%s", sid[:16] if sid else None, thread_ts)
+            logger.debug("JSONL monitor: session_id acquired sid=%s thread=%s", sid[:16] if sid else None, thread_ts)
             session_ref.claude_session_id = sid
         if not task_ref:
             return
@@ -1028,7 +1029,7 @@ def _monitor_session_jsonl(inst: dict, thread_ts: str, channel: str, client: Web
             # テキスト部分が長すぎる場合は切り詰め
             max_text = MAX_SLACK_MSG_LENGTH // 2
             if len(display) > max_text:
-                display = display[:max_text] + "\n...(続き)"
+                display = display[:max_text] + "\n" + t("status_continued")
             parts.append(f":speech_balloon: {display_prefix}\n{display}")
         if status_lines:
             status_text = "\n".join(status_lines)
@@ -1041,7 +1042,7 @@ def _monitor_session_jsonl(inst: dict, thread_ts: str, channel: str, client: Web
         if len(text) > MAX_SLACK_MSG_LENGTH:
             text = "...\n" + text[-MAX_SLACK_MSG_LENGTH:]
         if not final:
-            text += "\n:hourglass_flowing_sand: _実行中..._"
+            text += "\n" + t("status_running")
         try:
             if status_msg_ts:
                 client.chat_update(
@@ -1053,7 +1054,7 @@ def _monitor_session_jsonl(inst: dict, thread_ts: str, channel: str, client: Web
                 )
                 status_msg_ts = resp["ts"]
         except Exception as e:
-            logger.error("JSONL進捗更新エラー PID %d: %s", pid, e)
+            logger.error("JSONL progress update error PID %d: %s", pid, e)
 
     def _finalize_progress():
         """進捗メッセージを確定（⏳除去）。メッセージは保持して次回も同じメッセージに追記。"""
@@ -1084,7 +1085,7 @@ def _monitor_session_jsonl(inst: dict, thread_ts: str, channel: str, client: Web
                 text=text,
             )
         except Exception as e:
-            logger.error("JSONL質問投稿エラー PID %d: %s", pid, e)
+            logger.error("JSONL question post error PID %d: %s", pid, e)
         # pending_question を設定（最初の質問のみ対応）
         if metadata and metadata.get("questions"):
             q = metadata["questions"][0]
@@ -1207,7 +1208,7 @@ def _monitor_session_jsonl(inst: dict, thread_ts: str, channel: str, client: Web
             client.chat_postMessage(
                 channel=channel,
                 thread_ts=thread_ts,
-                text=f":stop_button: PID {pid} が終了しました",
+                text=t("session_pid_exited", pid=pid),
             )
         except Exception:
             pass
@@ -1380,7 +1381,7 @@ def _detect_permission_prompt(text: str) -> dict | None:
             if line:
                 desc_lines.append(line)
 
-    description = "\n".join(desc_lines) if desc_lines else "入力が必要です"
+    description = "\n".join(desc_lines) if desc_lines else t("question_input_required")
 
     return {
         "description": description,
@@ -1394,10 +1395,10 @@ def _post_permission_prompt(prompt_info: dict, thread_ts: str, channel_id: str,
     description = prompt_info["description"]
     options = prompt_info["options"]
 
-    lines = [":question: *CLIからの質問*", f"{description}"]
+    lines = [t("question_cli_header"), f"{description}"]
     for i, opt in enumerate(options, 1):
         lines.append(f"  {i}. {opt['label']}")
-    lines.append("_番号を返信してください（テキストでOther回答も可）_")
+    lines.append(t("question_reply_with_number"))
 
     text = "\n".join(lines)
     try:
@@ -1407,7 +1408,7 @@ def _post_permission_prompt(prompt_info: dict, thread_ts: str, channel_id: str,
             text=text,
         )
     except Exception as e:
-        logger.error("許可プロンプト投稿エラー: %s", e)
+        logger.error("Permission prompt post error: %s", e)
 
     inst["pending_question"] = {
         "options": options,
@@ -1485,10 +1486,10 @@ def _update_pty_pending(buf: bytes, inst: dict | None, thread_ts: str,
         description = prompt_info["description"]
         options = prompt_info["options"]
 
-        parts = [":question: *CLIからの質問*", description]
+        parts = [t("question_cli_header"), description]
         for i, opt in enumerate(options, 1):
             parts.append(f"  {i}. {opt['label']}")
-        parts.append("_番号を返信してください（テキストでOther回答も可）_")
+        parts.append(t("question_reply_with_number"))
         display_content = "\n".join(parts)
 
         # pending_question を設定（回答ルーティング用）
@@ -1509,7 +1510,7 @@ def _update_pty_pending(buf: bytes, inst: dict | None, thread_ts: str,
     inst["pty_pending_text"] = display_content
 
     # ペンディングインジケータ付きで表示
-    display = f":hourglass: _CLIからの出力（確認中）_\n{display_content}"
+    display = f"{t('status_cli_output_pending')}\n{display_content}"
 
     pending_ts = inst.get("pty_pending_msg_ts")
     try:
@@ -1523,7 +1524,7 @@ def _update_pty_pending(buf: bytes, inst: dict | None, thread_ts: str,
             )
             inst["pty_pending_msg_ts"] = resp["ts"]
     except Exception as e:
-        logger.error("PTY pending投稿エラー PID %d: %s", pid, e)
+        logger.error("PTY pending post error PID %d: %s", pid, e)
 
 
 def _finalize_pty_pending(inst: dict, channel_id: str, client: WebClient,
@@ -1558,10 +1559,10 @@ def _update_thinking_message(
         client.chat_update(
             channel=channel,
             ts=msg_ts,
-            text=f"```\n{display}\n```\n:hourglass_flowing_sand: _思考中..._",
+            text=f"```\n{display}\n```\n{t('status_thinking_progress')}",
         )
     except Exception as e:
-        logger.error("思考中更新エラー PID %d: %s", pid, e)
+        logger.error("Thinking update error PID %d: %s", pid, e)
 
 
 def _post_or_upload(
@@ -1576,7 +1577,7 @@ def _post_or_upload(
         )
     else:
         # 先頭の概要をメッセージとして投稿
-        preview = text[:500] + "\n...(全文はファイルを参照)"
+        preview = text[:500] + t("task_see_full_file")
         summary_msg = f"{header}\n{preview}" if header else preview
         client.chat_postMessage(
             channel=channel, thread_ts=thread_ts, text=summary_msg,
@@ -1585,7 +1586,7 @@ def _post_or_upload(
         client.files_upload_v2(
             channel=channel, thread_ts=thread_ts,
             content=text, filename=filename,
-            title="全文",
+            title=t("task_full_text_title"),
             initial_comment="",
         )
 
@@ -1596,7 +1597,7 @@ def _post_final_response(
 ):
     """応答完了時に新しいメッセージとして投稿（Slack通知が届く）+ 元メッセージの⏳を除去"""
     if timeout:
-        header = f":warning: PID {pid} _(タイムアウト — 部分的な応答)_"
+        header = t("task_timeout_header", pid=pid)
     else:
         header = f":speech_balloon: PID {pid}"
     try:
@@ -1606,13 +1607,13 @@ def _post_final_response(
             header=header, filename=f"response_pid{pid}.md",
         )
     except Exception as e:
-        logger.error("応答投稿エラー PID %d: %s", pid, e)
+        logger.error("Response post error PID %d: %s", pid, e)
     # 元の「送信しました」メッセージから⏳を除去
     try:
         client.chat_update(
             channel=channel,
             ts=msg_ts,
-            text=f":arrow_right: PID {pid} に入力を送信しました :white_check_mark:",
+            text=t("input_sent", pid=pid),
         )
     except Exception:
         pass
@@ -1753,7 +1754,7 @@ def _monitor_terminal_output(inst: dict, thread_ts: str, channel: str, client: W
                             text=f":speech_balloon: PID {pid}\n```\n{display}\n```",
                         )
                 except Exception as e:
-                    logger.error("パッシブ監視投稿エラー PID %d: %s", pid, e)
+                    logger.error("Passive monitor post error PID %d: %s", pid, e)
                 # ベースライン更新
                 inst["passive_baseline_len"] = len(current)
                 inst["passive_baseline_marker"] = current[-500:] if len(current) >= 500 else current
@@ -1772,16 +1773,16 @@ def _monitor_terminal_output(inst: dict, thread_ts: str, channel: str, client: W
                     if passive_msg_ts:
                         client.chat_update(
                             channel=channel, ts=passive_msg_ts,
-                            text=f"```\n{display}\n```\n:hourglass_flowing_sand: _実行中..._",
+                            text=f"```\n{display}\n```\n{t('status_running')}",
                         )
                     else:
                         resp = client.chat_postMessage(
                             channel=channel, thread_ts=thread_ts,
-                            text=f"```\n{display}\n```\n:hourglass_flowing_sand: _実行中..._",
+                            text=f"```\n{display}\n```\n{t('status_running')}",
                         )
                         passive_msg_ts = resp["ts"]
                 except Exception as e:
-                    logger.error("パッシブ進捗更新エラー PID %d: %s", pid, e)
+                    logger.error("Passive progress update error PID %d: %s", pid, e)
             continue
 
         poll_count += 1
@@ -1822,7 +1823,7 @@ def _monitor_terminal_output(inst: dict, thread_ts: str, channel: str, client: W
             if no_output_count >= STABLE_THRESHOLD:
                 clean_current = _strip_ansi(current).rstrip()
                 if re.search(r'❯\s*$', clean_current) or current != baseline_content:
-                    _post_final_response(client, channel, thread_ts, response_msg_ts, "（コマンド実行完了）", pid)
+                    _post_final_response(client, channel, thread_ts, response_msg_ts, t("status_command_completed"), pid)
                     _reset_state()
             continue
 
@@ -1841,8 +1842,8 @@ def _monitor_terminal_output(inst: dict, thread_ts: str, channel: str, client: W
         if not filtered:
             # フィルタ後にテキストがないが、❯プロンプトが末尾に出現 → 出力なしで完了
             if prompt_found:
-                logger.debug("MON %d → コマンド実行完了（filtered empty + prompt）", pid)
-                _post_final_response(client, channel, thread_ts, response_msg_ts, "（コマンド実行完了）", pid)
+                logger.debug("MON %d -> command completed (filtered empty + prompt)", pid)
+                _post_final_response(client, channel, thread_ts, response_msg_ts, t("status_command_completed"), pid)
                 _reset_state()
             continue
 
@@ -1850,7 +1851,7 @@ def _monitor_terminal_output(inst: dict, thread_ts: str, channel: str, client: W
 
         # 応答完了判定1: ❯ プロンプトが出現（次の入力待ち状態）
         if prompt_found:
-            logger.debug("MON %d → 応答投稿（prompt検出）", pid)
+            logger.debug("MON %d -> posting response (prompt detected)", pid)
             _post_final_response(client, channel, thread_ts, response_msg_ts, filtered, pid)
             _reset_state()
             continue
@@ -1865,14 +1866,14 @@ def _monitor_terminal_output(inst: dict, thread_ts: str, channel: str, client: W
             last_filtered = filtered
 
         if stable_count >= STABLE_THRESHOLD:
-            logger.debug("MON %d → 応答投稿（安定検出）", pid)
+            logger.debug("MON %d -> posting response (stable detected)", pid)
             _post_final_response(client, channel, thread_ts, response_msg_ts, filtered, pid)
             _reset_state()
             continue
 
         # 思考中の進捗更新: PROGRESS_INTERVALポールごとに途中経過を表示（ベストエフォート）
         if poll_count % PROGRESS_INTERVAL == 0 and filtered != last_progress_text:
-            logger.debug("MON %d → 思考中更新", pid)
+            logger.debug("MON %d -> thinking update", pid)
             _update_thinking_message(client, channel, response_msg_ts, filtered, pid)
             last_progress_text = filtered
 
@@ -1891,7 +1892,7 @@ def _monitor_terminal_output(inst: dict, thread_ts: str, channel: str, client: W
         client.chat_postMessage(
             channel=channel,
             thread_ts=thread_ts,
-            text=f":stop_button: PID {pid} が終了しました",
+            text=t("session_pid_exited", pid=pid),
         )
     except Exception:
         pass
@@ -1950,7 +1951,7 @@ class ClaudeCodeRunner:
             with open(DIRECTORY_HISTORY_FILE, "w") as f:
                 json.dump(self.directory_history, f, ensure_ascii=False, indent=2)
         except Exception as e:
-            logger.warning("ディレクトリ履歴の保存に失敗: %s", e)
+            logger.warning("Failed to save directory history: %s", e)
 
     def load_directory_history(self):
         """ディレクトリ履歴を読み込み"""
@@ -1960,7 +1961,7 @@ class ClaudeCodeRunner:
         except (FileNotFoundError, json.JSONDecodeError):
             pass
         except Exception as e:
-            logger.warning("ディレクトリ履歴の読み込みに失敗: %s", e)
+            logger.warning("Failed to load directory history: %s", e)
 
     # ── チャンネルルートディレクトリ ──
     def save_channel_roots(self):
@@ -1973,7 +1974,7 @@ class ClaudeCodeRunner:
             with open(CHANNEL_ROOTS_FILE, "w") as f:
                 json.dump(roots, f, ensure_ascii=False, indent=2)
         except Exception as e:
-            logger.warning("チャンネルルートの保存に失敗: %s", e)
+            logger.warning("Failed to save channel roots: %s", e)
 
     def load_channel_roots(self) -> dict[str, str]:
         """チャンネルルート設定を読み込み"""
@@ -1983,7 +1984,7 @@ class ClaudeCodeRunner:
         except (FileNotFoundError, json.JSONDecodeError):
             return {}
         except Exception as e:
-            logger.warning("チャンネルルートの読み込みに失敗: %s", e)
+            logger.warning("Failed to load channel roots: %s", e)
             return {}
 
     def get_channel_root(self, channel_id: str) -> Optional[str]:
@@ -2016,12 +2017,7 @@ class ClaudeCodeRunner:
         # AskUserQuestionは-pモードでは自動回答されユーザー入力を待てないため無効化。
         # 質問はテキスト出力→プロセス終了→ユーザー返信→--resumeで継続する。
         cmd.extend(["--disallowedTools", "AskUserQuestion"])
-        cmd.extend(["--append-system-prompt",
-                     "ユーザーに質問や確認が必要な場合は、AskUserQuestionツールを使わず、"
-                     "テキストで質問を出力してください。"
-                     "質問を出力したら、その場で応答を終了してください。"
-                     "ユーザーは次のメッセージで回答します。"
-                     "質問の回答を待たずに処理を進めないでください。"])
+        cmd.extend(["--append-system-prompt", t("prompt_system_append")])
 
         if task.resume_session:
             cmd.extend(["--resume", task.resume_session])
@@ -2050,9 +2046,9 @@ class ClaudeCodeRunner:
         if not cwd:
             # Safety net（新フローでは到達しないはず）
             task.status = TaskStatus.FAILED
-            task.error = "作業ディレクトリが未設定です"
+            task.error = t("task_working_dir_not_set")
             task.completed_at = datetime.now()
-            self._post_to_session(session, f"{session.label_emoji} {task.short_id}  :x: 作業ディレクトリが未設定です")
+            self._post_to_session(session, f"{session.label_emoji} {task.short_id}  :x: {t('task_working_dir_not_set')}")
             return
         channel_id = session.channel_id
         thread_ts = session.thread_ts
@@ -2065,12 +2061,12 @@ class ClaudeCodeRunner:
 
         if is_resume:
             header = (
-                f"{display_label}  :arrow_forward: *セッション続行*\n"
+                f"{display_label}  {t('task_resume_header')}\n"
                 f"```{task.prompt[:500]}```"
             )
         else:
             header = (
-                f"{display_label}  *タスク開始*\n"
+                f"{display_label}  {t('task_start_header')}\n"
                 f":file_folder: `{dir_display}`\n"
                 f"```{task.prompt[:500]}```"
             )
@@ -2147,21 +2143,21 @@ class ClaudeCodeRunner:
             jsonl_path = None
             for poll_i in range(30):
                 if proc.poll() is not None:
-                    logger.debug("_execute: JONLポーリング中にプロセス終了 pid=%d poll=%d thread=%s", proc.pid, poll_i, thread_ts)
+                    logger.debug("_execute: process exited during JSONL polling pid=%d poll=%d thread=%s", proc.pid, poll_i, thread_ts)
                     break
                 found = _find_session_jsonl(cwd, min_ctime=start_time)
                 if found:
                     jsonl_path = found
-                    logger.debug("_execute: JONLファイル発見 path=%s poll=%d thread=%s", found, poll_i, thread_ts)
+                    logger.debug("_execute: JSONL file found path=%s poll=%d thread=%s", found, poll_i, thread_ts)
                     break
                 time.sleep(1)
             else:
-                logger.warning("_execute: JONLファイルが30秒以内に見つからず pid=%d cwd=%s thread=%s", proc.pid, cwd, thread_ts)
+                logger.warning("_execute: JSONL file not found within 30s pid=%d cwd=%s thread=%s", proc.pid, cwd, thread_ts)
 
             # JSONL監視（プロセスがまだ実行中の場合）
             jsonl_monitored = False
             if jsonl_path and proc.poll() is not None:
-                logger.debug("_execute: JSONL発見済みだがプロセス既に終了 pid=%d jsonl=%s thread=%s", proc.pid, jsonl_path, thread_ts)
+                logger.debug("_execute: JSONL found but process already exited pid=%d jsonl=%s thread=%s", proc.pid, jsonl_path, thread_ts)
             if jsonl_path and proc.poll() is None:
                 if registered_thread_ts and registered_thread_ts in instance_threads:
                     inst = instance_threads[registered_thread_ts]
@@ -2188,25 +2184,25 @@ class ClaudeCodeRunner:
             proc.wait()
 
             if task.status == TaskStatus.CANCELLED:
-                self._post_to_session(session, f"{display_label}  :stop_sign: キャンセルされました")
+                self._post_to_session(session, f"{display_label}  {t('task_cancelled')}")
                 return
 
             # JSONL からsession_idを取得できなかった場合のフォールバック
             if not session.claude_session_id:
                 fallback_path = jsonl_path or _find_session_jsonl(cwd, min_ctime=start_time)
-                logger.debug("_execute: session_id未取得、フォールバック試行 fallback_path=%s jsonl_monitored=%s pid=%d thread=%s",
+                logger.debug("_execute: session_id not acquired, trying fallback fallback_path=%s jsonl_monitored=%s pid=%d thread=%s",
                              fallback_path, jsonl_monitored, proc.pid, thread_ts)
                 if fallback_path:
                     _extract_session_info_from_jsonl(task, session, fallback_path)
                     if session.claude_session_id:
-                        logger.debug("_execute: フォールバックでsession_id取得成功 sid=%s thread=%s",
+                        logger.debug("_execute: fallback session_id acquired sid=%s thread=%s",
                                      session.claude_session_id[:16], thread_ts)
                     else:
-                        logger.warning("_execute: フォールバックでもsession_id取得失敗 jsonl=%s thread=%s", fallback_path, thread_ts)
+                        logger.warning("_execute: fallback also failed to get session_id jsonl=%s thread=%s", fallback_path, thread_ts)
                 else:
-                    logger.warning("_execute: フォールバック用JONLファイルも見つからず pid=%d cwd=%s thread=%s", proc.pid, cwd, thread_ts)
+                    logger.warning("_execute: fallback JSONL file also not found pid=%d cwd=%s thread=%s", proc.pid, cwd, thread_ts)
             else:
-                logger.debug("_execute: タスク完了時 session_id=%s thread=%s", session.claude_session_id[:16], thread_ts)
+                logger.debug("_execute: task completed session_id=%s thread=%s", session.claude_session_id[:16], thread_ts)
 
             if proc.returncode == 0:
                 task.status = TaskStatus.COMPLETED
@@ -2226,14 +2222,14 @@ class ClaudeCodeRunner:
                 task.completed_at = datetime.now()
                 self._post_to_session(
                     session,
-                    f"{display_label}  :x: 失敗 (exit {proc.returncode})\n```{stderr_output[:1000]}```",
+                    f"{display_label}  {t('task_failed', code=proc.returncode)}\n```{stderr_output[:1000]}```",
                 )
 
         except Exception as e:
             task.status = TaskStatus.FAILED
             task.error = str(e)
             task.completed_at = datetime.now()
-            self._post_to_session(session, f"{display_label}  :x: エラー: {e}")
+            self._post_to_session(session, f"{display_label}  {t('task_error', error=e)}")
 
         finally:
             if master_fd is not None:
@@ -2253,12 +2249,12 @@ class ClaudeCodeRunner:
         dir_name = os.path.basename(cwd)
         display_label = f"{session.label_emoji} {task.short_id}"
         user_info = f"  <@{task.user_id}>" if task.user_id else ""
-        parts = [f"{display_label}  :white_check_mark: *タスク完了* ({elapsed:.0f}秒)  :file_folder: `{dir_name}`{user_info}"]
+        parts = [f"{display_label}  {t('task_complete', elapsed=elapsed)}  :file_folder: `{dir_name}`{user_info}"]
         if task.tool_calls:
-            tools_summary = ", ".join(f"`{t['name']}`" for t in task.tool_calls[:10])
+            tools_summary = ", ".join(f"`{tc['name']}`" for tc in task.tool_calls[:10])
             if len(task.tool_calls) > 10:
-                tools_summary += f" 他{len(task.tool_calls) - 10}件"
-            parts.append(f"使用ツール ({len(task.tool_calls)}回): {tools_summary}")
+                tools_summary += t("task_tools_more", count=len(task.tool_calls) - 10)
+            parts.append(t("task_tools_used", count=len(task.tool_calls), tools=tools_summary))
         full_result = None
         if show_result and task.result:
             result_text = _md_to_slack(task.result)
@@ -2269,12 +2265,12 @@ class ClaudeCodeRunner:
                 parts.append(f"\n{result_text}")
             else:
                 # メッセージには先頭のみ、全文はファイルアップロード
-                preview = result_text[:500] + "\n...(全文はファイルを参照)"
+                preview = result_text[:500] + t("task_see_full_file")
                 parts.append(f"\n{preview}")
                 full_result = task.result
         if session.claude_session_id:
             parts.append(f"\n_Session: `{session.claude_session_id[:12]}...`_")
-            parts.append(f"_このスレッドに返信すると自動で続行します_")
+            parts.append(t("task_reply_to_continue"))
         return "\n".join(parts), full_result
 
     def _post_to_session(self, session: Session, text: str):
@@ -2292,7 +2288,7 @@ class ClaudeCodeRunner:
                 )
                 session.thread_ts = resp["ts"]
         except Exception as e:
-            logger.error("Slack投稿エラー: %s", e)
+            logger.error("Slack post error: %s", e)
 
     def _upload_to_session(self, session: Session, content: str,
                            *, filename: str = "response.md"):
@@ -2303,10 +2299,10 @@ class ClaudeCodeRunner:
                 thread_ts=session.thread_ts or None,
                 content=content,
                 filename=filename,
-                title="全文",
+                title=t("task_full_text_title"),
             )
         except Exception as e:
-            logger.error("Slackファイルアップロードエラー: %s", e)
+            logger.error("Slack file upload error: %s", e)
 
     # ── キャンセル ──
     def cancel_task(self, task_id: int) -> bool:
@@ -2467,7 +2463,7 @@ def handle_message(event, say):
             if project:
                 session = project.sessions.get(parent_ts)
                 if session:
-                    logger.debug("スレッド返信: セッション発見 thread=%s claude_session_id=%s task数=%d active=%s",
+                    logger.debug("Thread reply: session found thread=%s claude_session_id=%s tasks=%d active=%s",
                                  parent_ts, session.claude_session_id[:16] if session.claude_session_id else "None",
                                  len(session.tasks), session.active_task is not None)
                     input_text = _strip_bot_mention(text)
@@ -2479,7 +2475,7 @@ def handle_message(event, say):
                         tools = input_text[6:].strip()
                         session.next_tools = tools
                         say(
-                            text=f":wrench: このセッションの次のタスクの許可ツール: `{tools}`\n続けてタスクを送信してください",
+                            text=t("tools_set", tools=tools),
                             thread_ts=parent_ts,
                         )
                         return
@@ -2500,11 +2496,11 @@ def handle_message(event, say):
             stripped = _strip_bot_mention(text)
             if stripped != text:
                 # メンション付きスレッド返信 → コマンドとして処理
-                logger.debug("スレッド返信: セッション未発見、メンション付きコマンドとして処理 thread=%s channel=%s project=%s",
+                logger.debug("Thread reply: session not found, processing as mentioned command thread=%s channel=%s project=%s",
                              parent_ts, channel_id, project is not None)
                 _dispatch_command(stripped, event, say)
             else:
-                logger.debug("スレッド返信: セッション未発見かつメンションなし、無視 thread=%s channel=%s project=%s",
+                logger.debug("Thread reply: session not found and no mention, ignoring thread=%s channel=%s project=%s",
                              parent_ts, channel_id, project is not None)
             return
 
@@ -2532,19 +2528,19 @@ def _build_question_answer_prompt(question_text: str, options: list[dict],
     """質問への回答プロンプトを構築。--resume なしでもClaude が文脈を理解できるよう質問全体を含める。"""
     parts = []
     if question_text:
-        parts.append(f"以下の質問への回答です:\n質問: {question_text}")
+        parts.append(t("prompt_answer_to_question", question=question_text))
     else:
-        parts.append("前の質問への回答です:")
+        parts.append(t("prompt_answer_to_prev"))
     if options:
         opts = "\n".join(
             f"  {i+1}. {o.get('label', '')}" + (f" — {o['description']}" if o.get('description') else "")
             for i, o in enumerate(options)
         )
-        parts.append(f"選択肢:\n{opts}")
+        parts.append(f"{t('prompt_options_label')}\n{opts}")
     if selected_num is not None:
-        parts.append(f"回答: {selected_num}. {answer_label}")
+        parts.append(t("prompt_answer_numbered", num=selected_num, label=answer_label))
     else:
-        parts.append(f"回答: {answer_label}")
+        parts.append(t("prompt_answer_text", label=answer_label))
     return "\n".join(parts)
 
 
@@ -2577,14 +2573,14 @@ def _handle_thread_reply_task(prompt: str, project: Project, session: Session,
     # セッションにclaude_session_idがまだ設定されていない場合、短時間待機
     # （前タスクの_executeがJSONL処理中の可能性があるため）
     if not session.claude_session_id and session.tasks:
-        logger.debug("_handle_thread_reply_task: session_id未設定、待機開始 thread=%s task数=%d", thread_ts, len(session.tasks))
+        logger.debug("_handle_thread_reply_task: session_id not set, starting wait thread=%s tasks=%d", thread_ts, len(session.tasks))
         for wait_i in range(10):
             time.sleep(0.3)
             if session.claude_session_id:
-                logger.debug("_handle_thread_reply_task: 待機中にsession_id取得 sid=%s wait=%.1fs", session.claude_session_id[:16], (wait_i+1)*0.3)
+                logger.debug("_handle_thread_reply_task: session_id acquired during wait sid=%s wait=%.1fs", session.claude_session_id[:16], (wait_i+1)*0.3)
                 break
         else:
-            logger.warning("_handle_thread_reply_task: 3秒待機してもsession_id取得できず thread=%s", thread_ts)
+            logger.warning("_handle_thread_reply_task: session_id not acquired after 3s wait thread=%s", thread_ts)
 
     task = Task(
         id=0,
@@ -2595,9 +2591,9 @@ def _handle_thread_reply_task(prompt: str, project: Project, session: Session,
     # セッションにclaude_session_idがあれば自動で --resume
     if session.claude_session_id:
         task.resume_session = session.claude_session_id
-        logger.debug("_handle_thread_reply_task: --resume付きでタスク作成 sid=%s thread=%s", session.claude_session_id[:16], thread_ts)
+        logger.debug("_handle_thread_reply_task: creating task with --resume sid=%s thread=%s", session.claude_session_id[:16], thread_ts)
     else:
-        logger.warning("_handle_thread_reply_task: session_idなし、--resumeなしで新規タスク実行 thread=%s", thread_ts)
+        logger.warning("_handle_thread_reply_task: no session_id, running new task without --resume thread=%s", thread_ts)
 
     err = runner.run_task(project, session, task)
     if err:
@@ -2644,7 +2640,7 @@ def _dispatch_command(text: str, event: dict, say):
     # ── tools <list> （トップレベルではエラー） ──
     if cmd_lower.startswith("tools "):
         say(
-            text=":warning: `tools` コマンドはスレッド内でのみ有効です。タスクのスレッドに返信してください。",
+            text=t("error_tools_thread_only"),
             thread_ts=thread_ts,
         )
         return
@@ -2652,7 +2648,7 @@ def _dispatch_command(text: str, event: dict, say):
     # ── continue / resume （廃止） ──
     if cmd_lower.startswith("continue") or cmd_lower.startswith("resume "):
         say(
-            text=":warning: `continue` / `resume` は廃止されました。タスクのスレッドに返信すると自動で続行します。",
+            text=t("error_continue_deprecated"),
             thread_ts=thread_ts,
         )
         return
@@ -2808,9 +2804,9 @@ def _handle_instance_input(text: str, say, parent_ts: str, channel_id: str,
                         # Down矢印で選択肢にナビゲート + Enter
                         pty_input = b"\x1b[B" * (num - 1) + b"\r"
                         os.write(master_fd, pty_input)
-                        action_label = f"選択肢 {num} ({options[num - 1].get('label', '')}) を選択"
+                        action_label = t("input_selected_option", num=num, label=options[num - 1].get('label', ''))
                     else:
-                        say(text=f":warning: 1〜{option_count} の番号を入力してください", thread_ts=parent_ts)
+                        say(text=t("error_enter_number_range", max=option_count), thread_ts=parent_ts)
                         return True
                 else:
                     # テキスト入力 → "Other" を選択してテキスト入力
@@ -2837,9 +2833,9 @@ def _handle_instance_input(text: str, say, parent_ts: str, channel_id: str,
 
             # Slack通知
             if action_label:
-                msg_text = f":arrow_right: PID {pid} に回答を送信: {action_label} :white_check_mark:"
+                msg_text = t("input_answer_sent", pid=pid, label=action_label)
             else:
-                msg_text = f":arrow_right: PID {pid} に入力を送信しました :white_check_mark:"
+                msg_text = t("input_sent", pid=pid)
             resp = slack_client.chat_postMessage(
                 channel=channel_id,
                 thread_ts=parent_ts,
@@ -2852,7 +2848,7 @@ def _handle_instance_input(text: str, say, parent_ts: str, channel_id: str,
 
         # ── TTYがない場合のエラー ──
         if not tty:
-            say(text=f":warning: PID {pid} にはTTYが接続されていません", thread_ts=parent_ts)
+            say(text=t("error_pid_no_tty", pid=pid), thread_ts=parent_ts)
             return True
 
         # ── 既存のAppleScript処理（外部検出インスタンス用） ──
@@ -2876,9 +2872,9 @@ def _handle_instance_input(text: str, say, parent_ts: str, channel_id: str,
                 if 1 <= num <= option_count:
                     # 番号で選択肢を選ぶ（0始まりインデックス）
                     script = _build_select_option_script(tty_device, num - 1)
-                    action_label = f"選択肢 {num} ({options[num - 1].get('label', '')}) を選択"
+                    action_label = t("input_selected_option", num=num, label=options[num - 1].get('label', ''))
                 else:
-                    say(text=f":warning: 1〜{option_count} の番号を入力してください", thread_ts=parent_ts)
+                    say(text=t("error_enter_number_range", max=option_count), thread_ts=parent_ts)
                     return True
             else:
                 # テキスト入力 → "Other" を選択してペースト
@@ -2920,10 +2916,10 @@ def _handle_instance_input(text: str, say, parent_ts: str, channel_id: str,
         )
         if result.returncode == 0:
             if action_label:
-                msg_text = f":arrow_right: PID {pid} に回答を送信: {action_label} :white_check_mark:"
+                msg_text = t("input_answer_sent", pid=pid, label=action_label)
             else:
-                msg_text_done = f":arrow_right: PID {pid} に入力を送信しました :white_check_mark:"
-                msg_text_wait = f":arrow_right: PID {pid} に入力を送信しました :hourglass_flowing_sand:"
+                msg_text_done = t("input_sent", pid=pid)
+                msg_text_wait = t("input_sent_waiting", pid=pid)
 
             if is_jsonl_mode:
                 # JSONL監視モード: メッセージtsを保存してモニタがステータスを追記する
@@ -2947,15 +2943,15 @@ def _handle_instance_input(text: str, say, parent_ts: str, channel_id: str,
                     inst["input_baseline_len"] = baseline_len
                     inst["input_baseline_marker"] = baseline_marker
         else:
-            say(text=f":x: 入力送信エラー: {result.stderr.strip()}", thread_ts=parent_ts)
+            say(text=t("error_input_send_failed", error=result.stderr.strip()), thread_ts=parent_ts)
     except OSError as e:
         if e.errno == 5:  # EIO — プロセス終了済み → instance_threadsから除去してフォールスルー
             instance_threads.pop(parent_ts, None)
             return False
         else:
-            say(text=f":x: 入力送信エラー: {e}", thread_ts=parent_ts)
+            say(text=t("error_input_send_failed", error=e), thread_ts=parent_ts)
     except Exception as e:
-        say(text=f":x: 入力送信エラー: {e}", thread_ts=parent_ts)
+        say(text=t("error_input_send_failed", error=e), thread_ts=parent_ts)
     return True
 
 
@@ -2966,53 +2962,35 @@ def handle_mention(event, say):
 
 
 def _help_text() -> str:
-    return (
-        ":robot_face: *Claude Code Bridge* — 使い方:\n"
-        "*基本操作:*\n"
-        "• `@bot in <path> <タスク>` → 指定ディレクトリでタスクを実行\n"
-        "• `@bot fork <PID> [<タスク>]` → 実行中のclaude CLIプロセスをフォーク\n"
-        "• `@bot fork` → フォーク可能なプロセス一覧\n"
-        "• `@bot <タスク>` → ディレクトリ選択画面から実行\n"
-        "• (スレッド返信) `<指示>` → 同セッションで自動続行（メンション不要）\n"
-        "*管理:*\n"
-        "• `@bot status` → タスクの状態一覧\n"
-        "• `@bot sessions` → セッション一覧\n"
-        "• `@bot cancel #2` → タスクをキャンセル\n"
-        "• `@bot cancel all` → 全タスクをキャンセル\n"
-        "*設定:*\n"
-        "• `@bot root <絶対パス>` → チャンネルのルートディレクトリを設定\n"
-        "• `@bot root` → 現在のルートディレクトリを表示\n"
-        "• `@bot root clear` → ルートディレクトリを解除\n"
-        "• (スレッド内) `tools <tool1,...>` → 次回の許可ツール設定"
-    )
+    return t("help_text")
 
 
 def _handle_status(say, thread_ts, channel_id: str):
     """プロジェクトスコープのタスク状態一覧"""
     project = runner.get_project(channel_id)
     if not project:
-        say(text=":zzz: このチャンネルにはまだタスクがありません", thread_ts=thread_ts)
+        say(text=t("status_no_tasks"), thread_ts=thread_ts)
         return
 
     active_sessions = project.active_sessions
     if not active_sessions:
         # 直近の完了タスクを表示
         all_tasks = project.all_tasks
-        recent = [t for t in all_tasks if t.status in (TaskStatus.COMPLETED, TaskStatus.FAILED, TaskStatus.CANCELLED)][-5:]
+        recent = [tk for tk in all_tasks if tk.status in (TaskStatus.COMPLETED, TaskStatus.FAILED, TaskStatus.CANCELLED)][-5:]
         if recent:
-            lines = [":zzz: 実行中のタスクはありません\n*直近の完了タスク:*"]
-            for t in reversed(recent):
-                emoji = ":white_check_mark:" if t.status == TaskStatus.COMPLETED else ":x:"
-                elapsed = ""
-                if t.started_at and t.completed_at:
-                    elapsed = f" ({(t.completed_at - t.started_at).total_seconds():.0f}秒)"
-                lines.append(f"{emoji} {t.short_id} {t.prompt[:40]}{elapsed}")
+            lines = [t("status_no_running_with_recent")]
+            for tk in reversed(recent):
+                emoji = ":white_check_mark:" if tk.status == TaskStatus.COMPLETED else ":x:"
+                elapsed_str = ""
+                if tk.started_at and tk.completed_at:
+                    elapsed_str = " " + t("status_elapsed_seconds", elapsed=(tk.completed_at - tk.started_at).total_seconds())
+                lines.append(f"{emoji} {tk.short_id} {tk.prompt[:40]}{elapsed_str}")
             say(text="\n".join(lines), thread_ts=thread_ts)
         else:
-            say(text=":zzz: 実行中のタスクはありません", thread_ts=thread_ts)
+            say(text=t("status_no_running_tasks"), thread_ts=thread_ts)
         return
 
-    lines = [f":gear: *実行中のタスク ({len(active_sessions)}セッション)*"]
+    lines = [t("status_running_tasks_header", count=len(active_sessions))]
     for session in active_sessions:
         task = session.active_task
         if not task:
@@ -3024,12 +3002,12 @@ def _handle_status(say, thread_ts, channel_id: str):
         user_info = f"  <@{task.user_id}>" if task.user_id else ""
         lines.append(
             f"\n{session.label_emoji} {task.short_id}"
-            f"  ({elapsed:.0f}秒, ツール{tool_count}回){user_info}\n"
+            f"  {t('status_elapsed_tools', elapsed=elapsed, tool_count=tool_count)}{user_info}\n"
             f"> {prompt_preview}"
         )
         if task.tool_calls:
-            recent_tools = " -> ".join(f"`{t['name']}`" for t in task.tool_calls[-3:])
-            lines.append(f"  最近: {recent_tools}")
+            recent_tools = " -> ".join(f"`{tc['name']}`" for tc in task.tool_calls[-3:])
+            lines.append(f"  {t('status_recent_tools', tools=recent_tools)}")
 
     say(text="\n".join(lines), thread_ts=thread_ts)
 
@@ -3039,7 +3017,7 @@ def _handle_cancel(text: str, say, thread_ts, channel_id: str):
 
     if arg == "all":
         count = runner.cancel_all_in_project(channel_id)
-        say(text=f":stop_sign: {count}件のタスクをキャンセルしました", thread_ts=thread_ts)
+        say(text=t("task_cancel_count", count=count), thread_ts=thread_ts)
         return
 
     task_id = parse_task_id(arg)
@@ -3052,15 +3030,15 @@ def _handle_cancel(text: str, say, thread_ts, channel_id: str):
                 task_id = active[0].active_task.id
         if task_id is None:
             say(
-                text=":warning: キャンセルするタスクを指定してください: `cancel #2` or `cancel all`",
+                text=t("error_cancel_specify"),
                 thread_ts=thread_ts,
             )
             return
 
     if runner.cancel_task(task_id):
-        say(text=f":stop_sign: タスク #{task_id} のキャンセルリクエストを送信しました", thread_ts=thread_ts)
+        say(text=t("task_cancel_request_sent", task_id=task_id), thread_ts=thread_ts)
     else:
-        say(text=f"タスク #{task_id} は実行中ではありません", thread_ts=thread_ts)
+        say(text=t("task_not_running", task_id=task_id), thread_ts=thread_ts)
 
 
 def _handle_root(text: str, say, thread_ts: str, channel_id: str):
@@ -3072,9 +3050,9 @@ def _handle_root(text: str, say, thread_ts: str, channel_id: str):
     if not rest:
         # 現在のルートを表示
         if project.root_dir:
-            say(text=f":file_folder: このチャンネルのルートディレクトリ: `{project.root_dir}`", thread_ts=thread_ts)
+            say(text=t("root_current", path=project.root_dir), thread_ts=thread_ts)
         else:
-            say(text=":file_folder: このチャンネルにルートディレクトリは設定されていません\n`root <絶対パス>` で設定できます", thread_ts=thread_ts)
+            say(text=t("root_not_set"), thread_ts=thread_ts)
         return
 
     if rest == "clear":
@@ -3083,25 +3061,25 @@ def _handle_root(text: str, say, thread_ts: str, channel_id: str):
             old = project.root_dir
             project.root_dir = None
             runner.save_channel_roots()
-            say(text=f":wastebasket: ルートディレクトリを解除しました（旧: `{old}`）", thread_ts=thread_ts)
+            say(text=t("root_cleared", old=old), thread_ts=thread_ts)
         else:
-            say(text=":file_folder: ルートディレクトリは設定されていません", thread_ts=thread_ts)
+            say(text=t("root_already_not_set"), thread_ts=thread_ts)
         return
 
     # パスを設定
     dir_path = os.path.expanduser(rest)
 
     if not os.path.isabs(dir_path):
-        say(text=f":warning: 絶対パスで指定してください: `{dir_path}`", thread_ts=thread_ts)
+        say(text=t("error_absolute_path_required", path=dir_path), thread_ts=thread_ts)
         return
 
     if not os.path.isdir(dir_path):
-        say(text=f":warning: ディレクトリが見つかりません: `{dir_path}`", thread_ts=thread_ts)
+        say(text=t("error_dir_not_found", path=dir_path), thread_ts=thread_ts)
         return
 
     project.root_dir = dir_path
     runner.save_channel_roots()
-    say(text=f":white_check_mark: ルートディレクトリを設定しました: `{dir_path}`\n以降 `@bot <タスク>` で即座に実行されます", thread_ts=thread_ts)
+    say(text=t("root_set", path=dir_path), thread_ts=thread_ts)
 
 
 def _start_task_in_dir(dir_path: str, prompt: str, say, thread_ts: str,
@@ -3136,7 +3114,7 @@ def _handle_in_dir(text: str, say, thread_ts, channel_id: str, user_id: str = ""
     rest = text[3:].strip()
     parts = rest.split(maxsplit=1)
     if len(parts) < 2:
-        say(text=":warning: 使い方: `in <path> タスク内容`\n絶対パスで指定してください（`~` 展開あり）", thread_ts=thread_ts)
+        say(text=t("error_in_usage"), thread_ts=thread_ts)
         return
 
     dir_path, prompt = parts
@@ -3149,14 +3127,13 @@ def _handle_in_dir(text: str, say, thread_ts, channel_id: str, user_id: str = ""
             dir_path = os.path.normpath(os.path.join(root, dir_path))
         else:
             say(
-                text=f":warning: 絶対パスで指定してください: `{dir_path}`\n"
-                     "💡 `root <絶対パス>` でルートディレクトリを設定すると相対パスが使えます",
+                text=t("error_absolute_path_with_root_hint", path=dir_path),
                 thread_ts=thread_ts,
             )
             return
 
     if not os.path.isdir(dir_path):
-        say(text=f":warning: ディレクトリが見つかりません: `{dir_path}`", thread_ts=thread_ts)
+        say(text=t("error_dir_not_found", path=dir_path), thread_ts=thread_ts)
         return
 
     _start_task_in_dir(dir_path, prompt, say, thread_ts, channel_id, user_id, files)
@@ -3172,13 +3149,13 @@ def _handle_fork(rest: str, say, thread_ts, channel_id: str, user_id: str,
     try:
         target_pid = int(pid_str)
     except ValueError:
-        say(text=":warning: PIDは数字で指定してください: `fork <PID> [<task>]`", thread_ts=thread_ts)
+        say(text=t("error_pid_not_number"), thread_ts=thread_ts)
         return
 
     # 実行中のclaude CLIプロセスを検出
     instances = detect_running_claude_instances()
     if not instances:
-        say(text=":mag: 実行中のclaude CLIインスタンスが見つかりません", thread_ts=thread_ts)
+        say(text=t("fork_no_instances"), thread_ts=thread_ts)
         return
 
     tracked_pids = {data["pid"] for data in instance_threads.values()}
@@ -3187,9 +3164,9 @@ def _handle_fork(rest: str, say, thread_ts, channel_id: str, user_id: str,
     matched = [i for i in candidates if i["pid"] == target_pid]
     if not matched:
         if target_pid in tracked_pids:
-            say(text=f":warning: PID {target_pid} は既に追跡中です", thread_ts=thread_ts)
+            say(text=t("fork_pid_already_tracked", pid=target_pid), thread_ts=thread_ts)
         else:
-            say(text=f":warning: PID {target_pid} が見つかりません", thread_ts=thread_ts)
+            say(text=t("fork_pid_not_found", pid=target_pid), thread_ts=thread_ts)
         return
 
     _execute_fork(matched[0], channel_id, say, thread_ts, user_id, initial_input)
@@ -3199,10 +3176,10 @@ def _handle_sessions(say, thread_ts, channel_id: str):
     """プロジェクトスコープのセッション一覧を表示"""
     project = runner.get_project(channel_id)
     if not project or not project.sessions:
-        say(text="セッション履歴はまだありません", thread_ts=thread_ts)
+        say(text=t("session_no_history"), thread_ts=thread_ts)
         return
 
-    lines = [":clipboard: *セッション一覧*"]
+    lines = [t("session_list_header")]
 
     # 最新のセッション10件を表示
     sessions = sorted(
@@ -3232,11 +3209,11 @@ def _handle_sessions(say, thread_ts, channel_id: str):
         prompt_preview = latest.prompt[:40] + ("..." if latest and len(latest.prompt) > 40 else "") if latest else ""
 
         lines.append(
-            f"{status_emoji} {session.label_emoji} `{sid}` ({task_count}タスク)"
+            f"{status_emoji} {session.label_emoji} `{sid}` {t('session_task_count', count=task_count)}"
             f" :file_folder:`{dir_name}` {prompt_preview}"
         )
 
-    lines.append("\n_タスクのスレッドに返信すると自動で続行します_")
+    lines.append(t("session_reply_to_continue"))
     say(text="\n".join(lines), thread_ts=thread_ts)
 
 
@@ -3247,13 +3224,13 @@ def _handle_fork_list(say, thread_ts, channel_id: str, user_id: str):
     candidates = [i for i in instances if i["pid"] not in tracked_pids] if instances else []
 
     if not candidates:
-        say(text=":mag: フォーク可能なclaude CLIインスタンスはありません", thread_ts=thread_ts)
+        say(text=t("fork_no_forkable"), thread_ts=thread_ts)
         return
 
-    lines = [":computer: *フォーク可能なclaude CLIインスタンス:*"]
+    lines = [t("fork_list_header")]
     for i, inst in enumerate(candidates, 1):
         lines.append(f"  `{i}` — PID {inst['pid']}  :file_folder: `{inst['cwd']}`  :clock1: {inst['etime']}")
-    lines.append("\n番号を入力して選択、または `cancel` でキャンセル")
+    lines.append(t("fork_select_or_cancel"))
     say(text="\n".join(lines), thread_ts=thread_ts)
 
     pending_fork_selections[channel_id] = {
@@ -3280,11 +3257,7 @@ def _execute_fork(inst: dict, channel_id: str, say, thread_ts, user_id: str,
 
     if not session_id:
         say(
-            text=(
-                f":x: PID {pid} の session_id を取得できませんでした\n"
-                f":file_folder: `{cwd}`\n"
-                f"JSONLファイルが見つからないか、session_id が含まれていません"
-            ),
+            text=t("fork_session_id_not_found", pid=pid, cwd=cwd),
             thread_ts=thread_ts,
         )
         return
@@ -3301,11 +3274,7 @@ def _execute_fork(inst: dict, channel_id: str, say, thread_ts, user_id: str,
     # 4. フォーク完了通知
     sid_info = f"\n_Session: `{session_id[:12]}...`_"
     say(
-        text=(
-            f":fork_and_knife: PID {pid} の文脈を引き継ぎました\n"
-            f":file_folder: `{cwd}`{sid_info}\n"
-            f"_このスレッドに返信すると同じ文脈で新しいタスクを実行します_"
-        ),
+        text=t("fork_success", pid=pid, cwd=cwd, sid_info=sid_info),
         thread_ts=thread_ts,
     )
 
@@ -3338,7 +3307,7 @@ def _handle_fork_selection(text: str, say, channel_id: str) -> bool:
     # cancel
     if input_text == "cancel":
         del pending_fork_selections[channel_id]
-        say(text=":x: フォーク選択をキャンセルしました", thread_ts=thread_ts)
+        say(text=t("fork_cancelled"), thread_ts=thread_ts)
         return True
 
     # 番号入力
@@ -3348,7 +3317,7 @@ def _handle_fork_selection(text: str, say, channel_id: str) -> bool:
         return False  # 数字でもcancelでもない → 通常のコマンド処理にfallthrough
 
     if num < 1 or num > len(instances):
-        say(text=f":warning: 1〜{len(instances)} の番号を入力してください", thread_ts=thread_ts)
+        say(text=t("error_enter_number_range", max=len(instances)), thread_ts=thread_ts)
         return True
 
     selected = instances[num - 1]
@@ -3356,7 +3325,7 @@ def _handle_fork_selection(text: str, say, channel_id: str) -> bool:
 
     # プロセス死亡チェック
     if not _is_process_alive(selected["pid"]):
-        say(text=f":warning: PID {selected['pid']} は既に終了しています", thread_ts=thread_ts)
+        say(text=t("fork_pid_exited", pid=selected['pid']), thread_ts=thread_ts)
         return True
 
     _execute_fork(selected, channel_id, say, thread_ts, user_id)
@@ -3373,8 +3342,7 @@ def _handle_bare_task(text: str, event: dict, say, channel_id: str, user_id: str
     if root:
         if not os.path.isdir(root):
             say(
-                text=f":warning: ルートディレクトリが見つかりません: `{root}`\n"
-                     "`root <絶対パス>` で再設定するか `root clear` で解除してください",
+                text=t("root_dir_not_found", path=root),
                 thread_ts=thread_ts,
             )
             return
@@ -3392,35 +3360,31 @@ def _handle_bare_task(text: str, event: dict, say, channel_id: str, user_id: str
     # 選択肢がない場合
     if not fork_candidates and not dir_history:
         say(
-            text=(
-                ":warning: 作業ディレクトリを指定してください\n"
-                "• `in <path> <タスク>` — 指定ディレクトリで実行\n"
-                "• `fork <PID>` — 実行中のプロセスをフォーク"
-            ),
+            text=t("error_need_working_dir"),
             thread_ts=thread_ts,
         )
         return
 
     # 選択肢リストを構築
     options = []  # (type, data) のリスト
-    lines = [":file_folder: *作業ディレクトリを選択してください:*"]
+    lines = [t("dir_select_header")]
 
     idx = 1
     if fork_candidates:
-        lines.append("\n:computer: *フォーク可能なプロセス:*")
+        lines.append(t("dir_forkable_header"))
         for inst in fork_candidates:
             lines.append(f"  `{idx}` — :fork_and_knife: PID {inst['pid']}  :file_folder: `{inst['cwd']}`  :clock1: {inst['etime']}")
             options.append(("fork", inst))
             idx += 1
 
     if dir_history:
-        lines.append("\n:clock1: *最近のディレクトリ:*")
+        lines.append(t("dir_recent_header"))
         for d in dir_history:
             lines.append(f"  `{idx}` — :file_folder: `{d}`")
             options.append(("dir", d))
             idx += 1
 
-    lines.append("\n番号で選択、絶対パスを入力、または `cancel` でキャンセル")
+    lines.append(t("dir_select_prompt"))
     say(text="\n".join(lines), thread_ts=thread_ts)
 
     pending_directory_requests[thread_ts] = {
@@ -3449,7 +3413,7 @@ def _handle_directory_selection(text: str, say, thread_ts: str) -> bool:
     # cancel
     if input_text.lower() == "cancel":
         del pending_directory_requests[thread_ts]
-        say(text=":x: キャンセルしました", thread_ts=thread_ts)
+        say(text=t("dir_cancelled"), thread_ts=thread_ts)
         return True
 
     # 番号入力
@@ -3457,7 +3421,7 @@ def _handle_directory_selection(text: str, say, thread_ts: str) -> bool:
     if num_match:
         num = int(num_match.group(1))
         if num < 1 or num > len(options):
-            say(text=f":warning: 1〜{len(options)} の番号を入力してください", thread_ts=thread_ts)
+            say(text=t("error_enter_number_range", max=len(options)), thread_ts=thread_ts)
             return True
 
         opt_type, opt_data = options[num - 1]
@@ -3466,14 +3430,14 @@ def _handle_directory_selection(text: str, say, thread_ts: str) -> bool:
         if opt_type == "fork":
             # フォーク候補選択
             if not _is_process_alive(opt_data["pid"]):
-                say(text=f":warning: PID {opt_data['pid']} は既に終了しています", thread_ts=thread_ts)
+                say(text=t("fork_pid_exited", pid=opt_data['pid']), thread_ts=thread_ts)
                 return True
             _execute_fork(opt_data, channel_id, say, thread_ts, user_id, prompt)
             return True
         else:
             # ディレクトリ選択
             if not os.path.isdir(opt_data):
-                say(text=f":warning: ディレクトリが見つかりません: `{opt_data}`", thread_ts=thread_ts)
+                say(text=t("error_dir_not_found", path=opt_data), thread_ts=thread_ts)
                 return True
             _start_task_in_dir(opt_data, prompt, say, thread_ts, channel_id, user_id, files)
             return True
@@ -3483,13 +3447,13 @@ def _handle_directory_selection(text: str, say, thread_ts: str) -> bool:
     if os.path.isabs(expanded):
         del pending_directory_requests[thread_ts]
         if not os.path.isdir(expanded):
-            say(text=f":warning: ディレクトリが見つかりません: `{expanded}`", thread_ts=thread_ts)
+            say(text=t("error_dir_not_found", path=expanded), thread_ts=thread_ts)
             return True
         _start_task_in_dir(expanded, prompt, say, thread_ts, channel_id, user_id, files)
         return True
 
     # 数字でもcancelでも絶対パスでもない → fallthroughしない（選択中なので）
-    say(text=":warning: 番号、絶対パス、または `cancel` を入力してください", thread_ts=thread_ts)
+    say(text=t("error_enter_number_path_cancel"), thread_ts=thread_ts)
     return True
 
 
@@ -3504,36 +3468,33 @@ def main():
     logger.info("  Allowed Channels: %s", SLACK_ALLOWED_CHANNELS or "(none)")
     logger.info("  Notification:     %s", NOTIFICATION_CHANNEL or "(log only)")
     logger.info("=" * 55)
-    logger.info("Ctrl+C で終了")
+    logger.info("Press Ctrl+C to stop")
 
     # ディレクトリ履歴・チャンネルルートを読み込み
     runner.load_directory_history()
     channel_roots = runner.load_channel_roots()
-    logger.info("  Channel Roots:    %d件", len(channel_roots))
+    logger.info("  Channel Roots:    %d", len(channel_roots))
 
     # 起動通知
     if NOTIFICATION_CHANNEL:
         try:
             slack_client.chat_postMessage(
                 channel=NOTIFICATION_CHANNEL,
-                text=(
-                    ":rocket: *Claude Code Bridge が起動しました*\n"
-                    "チャンネルで `@bot in <path> <タスク>` を送信してください"
-                ),
+                text=t("notify_startup"),
             )
         except Exception as e:
-            logger.warning("Slack起動通知の送信に失敗: %s", e)
+            logger.warning("Failed to send Slack startup notification: %s", e)
 
     handler = SocketModeHandler(app, SLACK_APP_TOKEN)
 
     def shutdown(signum, frame):
-        logger.info("シャットダウン中...")
+        logger.info("Shutting down...")
         runner.cancel_all()
         if NOTIFICATION_CHANNEL:
             try:
                 slack_client.chat_postMessage(
                     channel=NOTIFICATION_CHANNEL,
-                    text=":wave: Claude Code Bridge を停止しました",
+                    text=t("notify_shutdown"),
                 )
             except Exception:
                 pass
