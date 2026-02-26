@@ -435,7 +435,7 @@ class TestExtractSessionInfoFromJsonl:
         p = tmp_path / "output.jsonl"
         p.write_text(json.dumps({
             "type": "assistant",
-            "message": {"session_id": "sid-abc-123", "content": []},
+            "message": {"sessionId": "sid-abc-123", "content": []},
         }) + "\n")
         task = make_task()
         session = make_session()
@@ -511,7 +511,7 @@ class TestExtractSessionInfoFromJsonl:
         p = tmp_path / "output.jsonl"
         p.write_text(json.dumps({
             "type": "assistant",
-            "session_id": "sid-from-entry",
+            "sessionId": "sid-from-entry",
             "message": {"content": []},
         }) + "\n")
         task = make_task()

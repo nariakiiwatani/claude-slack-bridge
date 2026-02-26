@@ -38,6 +38,7 @@ Claude Code ⇔ Slack Bridge のセットアップ手順です。
    - `chat:write` — Send messages / メッセージ送信
    - `channels:history` — Read public channel messages / パブリックチャンネルのメッセージ読み取り
    - `groups:history` — Read private channel messages / プライベートチャンネルのメッセージ読み取り
+   - `files:read` — Read files (for attachment downloads) / ファイル読み取り（添付ファイルダウンロード用）
    - `files:write` — Upload files (for large results) / ファイル送信（結果が大きい場合用）
 
 ---
@@ -119,17 +120,12 @@ If `NOTIFICATION_CHANNEL` is set, you'll see a startup notification:
 
 1. Invite the bot to a channel / botをチャンネルに招待
 
-2. Bind a project root / プロジェクトルートを紐付け:
+2. Send your first task with a working directory / 作業ディレクトリを指定してタスクを送信:
    ```
-   @bot bind -d /path/to/your/project
-   ```
-
-3. Send your first task / 最初のタスクを送信:
-   ```
-   @bot Hello! What files are in this project?
+   @bot in /path/to/your/project Hello! What files are in this project?
    ```
 
-4. The bot creates a thread for the session. Reply in the thread to continue (no `@bot` needed).
+3. The bot creates a thread for the session. Reply in the thread to continue (no `@bot` needed).
    botがスレッドを作成します。スレッドに返信すれば自動で続行します（`@bot` 不要）。
 
 ---
