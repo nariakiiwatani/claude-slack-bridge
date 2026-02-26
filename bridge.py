@@ -2013,6 +2013,16 @@ class ClaudeCodeRunner:
         if tools:
             cmd.extend(["--allowedTools", tools])
 
+        # AskUserQuestionは-pモードでは自動回答されユーザー入力を待てないため無効化。
+        # 質問はテキスト出力→プロセス終了→ユーザー返信→--resumeで継続する。
+        cmd.extend(["--disallowedTools", "AskUserQuestion"])
+        cmd.extend(["--append-system-prompt",
+                     "ユーザーに質問や確認が必要な場合は、AskUserQuestionツールを使わず、"
+                     "テキストで質問を出力してください。"
+                     "質問を出力したら、その場で応答を終了してください。"
+                     "ユーザーは次のメッセージで回答します。"
+                     "質問の回答を待たずに処理を進めないでください。"])
+
         if task.resume_session:
             cmd.extend(["--resume", task.resume_session])
 
