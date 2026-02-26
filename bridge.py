@@ -26,6 +26,7 @@ Mac上で動くClaude CodeをSlackから操作するブリッジ。
 """
 
 import fcntl
+import io
 import json
 import logging
 import os
@@ -85,7 +86,7 @@ DEFAULT_ALLOWED_TOOLS = os.getenv(
     "Read,Write,Edit,MultiEdit,Bash(git *),TodoWrite",
 )
 
-MAX_SLACK_MSG_LENGTH = 3000
+MAX_SLACK_MSG_LENGTH = 39000  # Slack API上限は約40,000文字
 MAX_SLACK_FILE_SIZE = 20 * 1024 * 1024  # 20MB
 DIRECTORY_HISTORY_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "directory_history.json")
 CHANNEL_ROOTS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "channel_roots.json")
@@ -1053,12 +1054,11 @@ def _monitor_session_jsonl(inst: dict, thread_ts: str, channel: str, client: Web
         _finalize_status()
         # 応答テキストを独立した新規メッセージとして投稿
         display = _md_to_slack(text)
-        if len(display) > MAX_SLACK_MSG_LENGTH:
-            display = "...\n" + display[-MAX_SLACK_MSG_LENGTH:]
         try:
-            client.chat_postMessage(
-                channel=channel, thread_ts=thread_ts,
-                text=f":speech_balloon: {display_prefix}\n{display}",
+            _post_or_upload(
+                client, channel, thread_ts, display,
+                header=f":speech_balloon: {display_prefix}",
+                filename=f"response_pid{pid}.md",
             )
         except Exception as e:
             logger.error("JSONL応答投稿エラー PID %d: %s", pid, e)
@@ -1554,23 +1554,46 @@ def _update_thinking_message(
         logger.error("思考中更新エラー PID %d: %s", pid, e)
 
 
+def _post_or_upload(
+    client: WebClient, channel: str, thread_ts: str,
+    text: str, *, header: str = "", filename: str = "response.md",
+):
+    """テキストをSlackに投稿。MAX_SLACK_MSG_LENGTHを超える場合はファイルとしてアップロード。"""
+    full_msg = f"{header}\n{text}" if header else text
+    if len(full_msg) <= MAX_SLACK_MSG_LENGTH:
+        client.chat_postMessage(
+            channel=channel, thread_ts=thread_ts, text=full_msg,
+        )
+    else:
+        # 先頭の概要をメッセージとして投稿
+        preview = text[:500] + "\n...(全文はファイルを参照)"
+        summary_msg = f"{header}\n{preview}" if header else preview
+        client.chat_postMessage(
+            channel=channel, thread_ts=thread_ts, text=summary_msg,
+        )
+        # 全文をファイルとしてアップロード
+        client.files_upload_v2(
+            channel=channel, thread_ts=thread_ts,
+            content=text, filename=filename,
+            title="全文",
+            initial_comment="",
+        )
+
+
 def _post_final_response(
     client: WebClient, channel: str, thread_ts: str,
     msg_ts: str, text: str, pid: int, timeout: bool = False,
 ):
     """応答完了時に新しいメッセージとして投稿（Slack通知が届く）+ 元メッセージの⏳を除去"""
-    display = text
-    if len(display) > MAX_SLACK_MSG_LENGTH:
-        display = "...\n" + display[-MAX_SLACK_MSG_LENGTH:]
     if timeout:
         header = f":warning: PID {pid} _(タイムアウト — 部分的な応答)_"
     else:
         header = f":speech_balloon: PID {pid}"
     try:
-        client.chat_postMessage(
-            channel=channel,
-            thread_ts=thread_ts,
-            text=f"{header}\n```\n{display}\n```",
+        _post_or_upload(
+            client, channel, thread_ts,
+            f"```\n{text}\n```",
+            header=header, filename=f"response_pid{pid}.md",
         )
     except Exception as e:
         logger.error("応答投稿エラー PID %d: %s", pid, e)
@@ -2169,10 +2192,12 @@ class ClaudeCodeRunner:
                 task.status = TaskStatus.COMPLETED
                 task.completed_at = datetime.now()
                 elapsed = (task.completed_at - task.started_at).total_seconds()
-                summary = self._format_result(
+                summary, full_result = self._format_result(
                     task, session, elapsed, show_result=not jsonl_monitored
                 )
                 self._post_to_session(session, summary)
+                if full_result:
+                    self._upload_to_session(session, full_result, filename=f"result_{task.short_id}.md")
             else:
                 stderr_raw = proc.stderr.read() if proc.stderr else ""
                 stderr_output = stderr_raw.decode("utf-8", errors="replace") if isinstance(stderr_raw, bytes) else stderr_raw
@@ -2201,7 +2226,9 @@ class ClaudeCodeRunner:
                 instance_threads.pop(registered_thread_ts, None)
 
     def _format_result(self, task: Task, session: Session, elapsed: float,
-                       show_result: bool = True) -> str:
+                       show_result: bool = True) -> tuple[str, str | None]:
+        """タスク完了メッセージを生成。(summary, full_result_or_none) を返す。
+        full_result_or_none はメッセージに収まらない場合のみ非Noneでファイルアップロード用。"""
         cwd = session.working_dir or "(unknown)"
         dir_name = os.path.basename(cwd)
         display_label = f"{session.label_emoji} {task.short_id}"
@@ -2212,15 +2239,23 @@ class ClaudeCodeRunner:
             if len(task.tool_calls) > 10:
                 tools_summary += f" 他{len(task.tool_calls) - 10}件"
             parts.append(f"使用ツール ({len(task.tool_calls)}回): {tools_summary}")
+        full_result = None
         if show_result and task.result:
-            result_text = _md_to_slack(task.result)[:MAX_SLACK_MSG_LENGTH]
-            if len(task.result) > MAX_SLACK_MSG_LENGTH:
-                result_text += "\n...(省略)"
-            parts.append(f"\n{result_text}")
+            result_text = _md_to_slack(task.result)
+            # ヘッダー部分の長さを考慮して、全体がMAX_SLACK_MSG_LENGTHに収まるか判定
+            header_len = sum(len(p) for p in parts) + 10  # 改行等のマージン
+            available = MAX_SLACK_MSG_LENGTH - header_len
+            if len(result_text) <= available:
+                parts.append(f"\n{result_text}")
+            else:
+                # メッセージには先頭のみ、全文はファイルアップロード
+                preview = result_text[:500] + "\n...(全文はファイルを参照)"
+                parts.append(f"\n{preview}")
+                full_result = task.result
         if session.claude_session_id:
             parts.append(f"\n_Session: `{session.claude_session_id[:12]}...`_")
             parts.append(f"_このスレッドに返信すると自動で続行します_")
-        return "\n".join(parts)
+        return "\n".join(parts), full_result
 
     def _post_to_session(self, session: Session, text: str):
         """セッション（スレッド）にメッセージを投稿"""
@@ -2238,6 +2273,20 @@ class ClaudeCodeRunner:
                 session.thread_ts = resp["ts"]
         except Exception as e:
             logger.error("Slack投稿エラー: %s", e)
+
+    def _upload_to_session(self, session: Session, content: str,
+                           *, filename: str = "response.md"):
+        """セッション（スレッド）にファイルをアップロード"""
+        try:
+            self.client.files_upload_v2(
+                channel=session.channel_id,
+                thread_ts=session.thread_ts or None,
+                content=content,
+                filename=filename,
+                title="全文",
+            )
+        except Exception as e:
+            logger.error("Slackファイルアップロードエラー: %s", e)
 
     # ── キャンセル ──
     def cancel_task(self, task_id: int) -> bool:
