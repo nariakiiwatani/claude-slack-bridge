@@ -2410,14 +2410,17 @@ class ClaudeCodeRunner:
             # resumeタスクの場合、既存JSONLのbirthtimeはstart_timeより古いため
             # min_ctimeなしでも検索する
             jsonl_path = None
+            jsonl_is_existing = False  # resume時に既存ファイルが見つかった場合True
             poll_i = 0
             while proc.poll() is None:
                 found = _find_session_jsonl(cwd, min_ctime=start_time)
                 if not found and is_resume:
                     found = _find_session_jsonl(cwd, min_mtime=start_time)
+                    if found:
+                        jsonl_is_existing = True
                 if found:
                     jsonl_path = found
-                    logger.debug("_execute: JSONL file found path=%s poll=%d thread=%s", found, poll_i, thread_ts)
+                    logger.debug("_execute: JSONL file found path=%s poll=%d existing=%s thread=%s", found, poll_i, jsonl_is_existing, thread_ts)
                     break
                 poll_i += 1
                 time.sleep(1)
@@ -2429,11 +2432,14 @@ class ClaudeCodeRunner:
             if jsonl_path and proc.poll() is not None:
                 logger.debug("_execute: JSONL found but process already exited pid=%d jsonl=%s thread=%s", proc.pid, jsonl_path, thread_ts)
             if jsonl_path and proc.poll() is None:
+                # 既存ファイル（resume追記）: 既存内容をスキップして新規エントリのみ読む
+                # 新規ファイル: 先頭から読む
+                start_from_beginning = not jsonl_is_existing
                 if registered_thread_ts and registered_thread_ts in instance_threads:
                     inst = instance_threads[registered_thread_ts]
                     inst["jsonl_path"] = jsonl_path
                     inst["fixed_jsonl"] = True
-                    inst["start_from_beginning"] = True
+                    inst["start_from_beginning"] = start_from_beginning
                     inst["task"] = task
                     inst["session"] = session
                 else:
@@ -2444,7 +2450,7 @@ class ClaudeCodeRunner:
                         "display_prefix": display_label,
                         "skip_exit_message": True,
                         "fixed_jsonl": True,
-                        "start_from_beginning": True,
+                        "start_from_beginning": start_from_beginning,
                         "task": task,
                         "session": session,
                     }
