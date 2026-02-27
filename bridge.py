@@ -1032,6 +1032,7 @@ def _monitor_session_jsonl(inst: dict, thread_ts: str, channel: str, client: Web
 
     status_msg_ts: Optional[str] = None  # ステータスメッセージ（thinking/tool_use）
     status_lines: list[str] = []          # ステータス行の蓄積
+    all_status_history: list[str] = []    # 全ステータス履歴（完了時スニペット用）
     last_posted_text: Optional[str] = None  # 重複投稿防止用
     latest_text: Optional[str] = None  # 最新のテキスト応答（進捗メッセージ内に表示）
     pty_pending_cleaned: bool = False  # PTY pending cleanup 追跡
@@ -1141,6 +1142,8 @@ def _monitor_session_jsonl(inst: dict, thread_ts: str, channel: str, client: Web
             return  # 同一テキストの重複更新を防止
         last_posted_text = text
         latest_text = text
+        # テキスト応答も履歴に追加（完了時スニペットに含めるため）
+        all_status_history.append(f"💬\n{text}")
         # JSONL経由で正式な応答が来たため、PTYペンディングメッセージを削除（初回のみ）
         if not pty_pending_cleaned:
             _finalize_pty_pending(inst, channel, client, delete=True)
@@ -1233,6 +1236,7 @@ def _monitor_session_jsonl(inst: dict, thread_ts: str, channel: str, client: Web
                         for category, text, metadata in _classify_jsonl_entry(entry):
                             if category == "status":
                                 status_lines.append(f"  ↳ {text}")
+                                all_status_history.append(f"  ↳ {text}")
                                 has_sub_status = True
                     if has_sub_status:
                         _flush_progress()
@@ -1261,6 +1265,7 @@ def _monitor_session_jsonl(inst: dict, thread_ts: str, channel: str, client: Web
             for category, text, metadata in _classify_jsonl_entry(entry):
                 if category == "status":
                     status_lines.append(text)
+                    all_status_history.append(text)
                     has_status = True
                 elif category == "text":
                     text_parts.append(text)
@@ -1288,6 +1293,7 @@ def _monitor_session_jsonl(inst: dict, thread_ts: str, channel: str, client: Web
                 for category, text, metadata in _classify_jsonl_entry(entry):
                     if category == "status":
                         status_lines.append(f"  ↳ {text}")
+                        all_status_history.append(f"  ↳ {text}")
                         has_status = True
 
         # バッファリング中のプラン承認: テキストが来たら概要→プラン→承認の順で投稿
@@ -1329,6 +1335,7 @@ def _monitor_session_jsonl(inst: dict, thread_ts: str, channel: str, client: Web
             for category, text, metadata in _classify_jsonl_entry(entry):
                 if category == "status":
                     status_lines.append(text)
+                    all_status_history.append(text)
                     has_status = True
                 elif category == "text":
                     text_parts.append(text)
@@ -1352,6 +1359,7 @@ def _monitor_session_jsonl(inst: dict, thread_ts: str, channel: str, client: Web
                 for category, text, metadata in _classify_jsonl_entry(entry):
                     if category == "status":
                         status_lines.append(f"  ↳ {text}")
+                        all_status_history.append(f"  ↳ {text}")
                         has_status = True
         # バッファリング中のプラン承認をフラッシュ
         if pending_plan_approval:
@@ -1377,6 +1385,10 @@ def _monitor_session_jsonl(inst: dict, thread_ts: str, channel: str, client: Web
 
     # 残った進捗を確定
     _finalize_progress()
+
+    # ステータス履歴と進捗メッセージtsをinstに格納（_executeで使用）
+    inst["_status_history"] = all_status_history
+    inst["_status_msg_ts"] = status_msg_ts
 
     # プロセス終了通知（外部インスタンス用）
     if not skip_exit:
@@ -2354,6 +2366,7 @@ class ClaudeCodeRunner:
         master_fd = None
         registered_thread_ts = None
         jsonl_path = None
+        inst = None
 
         try:
             # サブプロセス起動前のタイムスタンプを記録（JSONL検出用）
@@ -2472,6 +2485,7 @@ class ClaudeCodeRunner:
 
             if task.status == TaskStatus.CANCELLED:
                 self._post_to_session(session, f"{display_label}  {t('task_cancelled')}")
+                self._cleanup_status_message(inst, session, task)
                 return
 
             # JSONL からsession_idを取得できなかった場合のフォールバック
@@ -2513,11 +2527,15 @@ class ClaudeCodeRunner:
                     f"{display_label}  {t('task_failed', code=proc.returncode)}\n```{stderr_output[:1000]}```",
                 )
 
+            # ステータス履歴スニペット投稿 + 進捗メッセージ削除
+            self._cleanup_status_message(inst, session, task)
+
         except Exception as e:
             task.status = TaskStatus.FAILED
             task.error = str(e)
             task.completed_at = datetime.now()
             self._post_to_session(session, f"{display_label}  {t('task_error', error=e)}")
+            self._cleanup_status_message(inst, session, task)
 
         finally:
             if jsonl_path:
@@ -2593,6 +2611,36 @@ class ClaudeCodeRunner:
             )
         except Exception as e:
             logger.error("Slack file upload error: %s", e)
+
+    def _cleanup_status_message(self, inst: dict | None, session: Session, task: Task):
+        """タスク完了時: ステータス履歴をスニペット投稿し、進捗メッセージを削除"""
+        if not inst:
+            return
+        all_status_history = inst.get("_status_history", [])
+        status_msg_ts = inst.get("_status_msg_ts")
+
+        # ステータス履歴が十分にあればスニペットとして投稿
+        if len(all_status_history) >= 3:
+            try:
+                self.client.files_upload_v2(
+                    channel=session.channel_id,
+                    thread_ts=session.thread_ts or None,
+                    content="\n".join(all_status_history),
+                    filename=f"progress_{task.short_id}.txt",
+                    title=t("status_history_title"),
+                )
+            except Exception as e:
+                logger.error("Status history upload error: %s", e)
+
+        # 進捗メッセージを削除（ベストエフォート）
+        if status_msg_ts:
+            try:
+                self.client.chat_delete(
+                    channel=session.channel_id,
+                    ts=status_msg_ts,
+                )
+            except Exception as e:
+                logger.debug("Status message delete failed (best-effort): %s", e)
 
     # ── キャンセル ──
     def cancel_task(self, task_id: int) -> bool:
