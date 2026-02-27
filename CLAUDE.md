@@ -6,7 +6,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 A bridge that lets users control Claude Code (CLI) from Slack on their Mac. Multiple tasks can run concurrently. Uses Slack Socket Mode (no public URL required).
 
-Channel mode only: Whitelisted users/channels (`SLACK_ALLOWED_USERS`, `SLACK_ALLOWED_CHANNELS`). Requires `@bot` mention for top-level messages. Thread replies to tracked sessions are forwarded without mention.
+Channel mode only: Whitelisted users/channels (`SLACK_ALLOWED_USERS`, `SLACK_ALLOWED_CHANNELS`). Requires `@bot` mention for all commands (top-level and in-thread). Thread replies without mention are forwarded to CLI or create resume tasks.
 
 Tasks are started with a directory specified at invocation time via three methods:
 - `@bot in <path> <task>` — run in specified directory
@@ -51,7 +51,7 @@ Everything is in a single file: `bridge.py`. Tests are in `tests/`.
 
 - **Access control** — `_is_user_allowed()` and `_is_channel_allowed()` check whitelists. `ADMIN_SLACK_USER_ID` is always allowed. `*` means allow all.
 
-- **Slack event handler** — `handle_message` is the main event handler. Routes channel events (whitelisted, mention required for top-level). Thread reply routing: (1) `instance_threads` with active PTY → forward to CLI, (1.5) `pending_directory_requests` → directory selection, (2) session exists → auto-resume via new task, (3) fallback to command. `_dispatch_command` is the command parser. `handle_mention` (`app_mention` event) is a no-op to avoid duplicate processing.
+- **Slack event handler** — `handle_message` is the main event handler. Routes channel events (whitelisted, mention required for top-level). Thread reply routing: (1) `instance_threads` with active PTY → mention=command, otherwise forward to CLI, (1.5) `pending_directory_requests` → directory selection, (2) session exists → mention=command (`cancel`/`status`/`tools`), otherwise auto-resume via new task, (3) fallback to command (mention required). `_dispatch_command` is the command parser. `handle_mention` (`app_mention` event) is a no-op to avoid duplicate processing.
 
 - **Notifications** — `NOTIFICATION_CHANNEL` (optional) receives startup/shutdown notifications. If unset, these are logged only.
 
