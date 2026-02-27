@@ -15,7 +15,11 @@ MESSAGES: dict[str, dict[str, str]] = {
             "• `@bot fork <PID> [<タスク>]` → 実行中のclaude CLIプロセスをフォーク\n"
             "• `@bot fork` → フォーク可能なプロセス一覧\n"
             "• `@bot <タスク>` → ディレクトリ選択画面から実行\n"
-            "• (スレッド返信) `<指示>` → 同セッションで自動続行（メンション不要）\n"
+            "*スレッド返信:*\n"
+            "• `<指示>` → 同セッションで自動続行（メンション不要）\n"
+            "• `@bot cancel [#id|all]` → タスクをキャンセル\n"
+            "• `@bot status` → タスクの状態一覧\n"
+            "• `@bot tools <tool1,...>` → 次回の許可ツール設定\n"
             "*管理:*\n"
             "• `@bot status` → タスクの状態一覧\n"
             "• `@bot sessions` → セッション一覧\n"
@@ -24,8 +28,7 @@ MESSAGES: dict[str, dict[str, str]] = {
             "*設定:*\n"
             "• `@bot root <絶対パス>` → チャンネルのルートディレクトリを設定\n"
             "• `@bot root` → 現在のルートディレクトリを表示\n"
-            "• `@bot root clear` → ルートディレクトリを解除\n"
-            "• (スレッド内) `tools <tool1,...>` → 次回の許可ツール設定"
+            "• `@bot root clear` → ルートディレクトリを解除"
         ),
 
         # ── status ──
@@ -185,7 +188,11 @@ MESSAGES: dict[str, dict[str, str]] = {
             "• `@bot fork <PID> [<task>]` → Fork a running Claude CLI process\n"
             "• `@bot fork` → List forkable processes\n"
             "• `@bot <task>` → Run from directory selection\n"
-            "• (thread reply) `<instruction>` → Continue in same session (no mention needed)\n"
+            "*Thread replies:*\n"
+            "• `<instruction>` → Continue in same session (no mention needed)\n"
+            "• `@bot cancel [#id|all]` → Cancel a task\n"
+            "• `@bot status` → Show task status\n"
+            "• `@bot tools <tool1,...>` → Set allowed tools for next task\n"
             "*Management:*\n"
             "• `@bot status` → Show task status\n"
             "• `@bot sessions` → Show session list\n"
@@ -194,8 +201,7 @@ MESSAGES: dict[str, dict[str, str]] = {
             "*Settings:*\n"
             "• `@bot root <absolute-path>` → Set channel root directory\n"
             "• `@bot root` → Show current root directory\n"
-            "• `@bot root clear` → Clear root directory\n"
-            "• (in thread) `tools <tool1,...>` → Set allowed tools for next task"
+            "• `@bot root clear` → Clear root directory"
         ),
 
         # ── status ──

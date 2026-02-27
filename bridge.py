@@ -10,12 +10,11 @@ Mac上で動くClaude CodeをSlackから操作するブリッジ。
   Session (= Slack Thread)  — Project 内で並列。タスクの直列チェーン
   Task    (= 指示→完了)     — Session 内で直列。スレッド返信で自動 --resume
 
-コマンド:
+コマンド（すべて @bot メンション付きで送信）:
   in <path> <タスク>        → 指定ディレクトリでタスクを実行
   fork <PID> [<タスク>]     → 実行中のclaude CLIプロセスをフォーク
   fork                      → フォーク可能なプロセス一覧
   <タスク内容>              → ディレクトリ選択画面からタスクを実行（root設定時は即実行）
-  (スレッド返信) <指示>     → 同セッションで --resume 続行
   root [<path>|clear]       → チャンネルのルートディレクトリ設定/表示/解除
   status                    → タスクの状態一覧
   sessions                  → セッション一覧
@@ -23,6 +22,9 @@ Mac上で動くClaude CodeをSlackから操作するブリッジ。
   cancel all                → 全タスクをキャンセル
   tools <list>              → 次回タスクの許可ツール設定（スレッド内のみ）
   help                      → ヘルプ表示
+
+スレッド返信（メンションなし）:
+  <指示>                    → 同セッションで --resume 続行（タスク待機中はCLIに転送）
 """
 
 import fcntl
@@ -2841,7 +2843,24 @@ def handle_message(event, say):
             # 1. instance_threads に登録あり & アクティブタスク実行中 → PTY に入力転送
             if parent_ts in instance_threads:
                 logger.info("Thread reply: routing to instance_threads (PTY) thread=%s", parent_ts)
-                input_text = _strip_bot_mention(text)
+                # メンション付きならコマンド判定を優先
+                stripped = _strip_bot_mention(text)
+                if stripped != text:
+                    cmd_lower = stripped.lower()
+                    if cmd_lower.startswith("cancel"):
+                        _handle_cancel(stripped, say, parent_ts, channel_id)
+                        return
+                    if cmd_lower == "status":
+                        _handle_status(say, parent_ts, channel_id)
+                        return
+                    if cmd_lower.startswith("tools "):
+                        session = runner.get_or_create_project(channel_id).sessions.get(parent_ts)
+                        if session:
+                            tools = stripped[6:].strip()
+                            session.next_tools = tools
+                            say(text=t("tools_set", tools=tools), thread_ts=parent_ts)
+                            return
+                input_text = stripped if stripped != text else text
                 input_text = "/" + input_text[1:] if input_text.startswith("!") else input_text
                 handled = _handle_instance_input(input_text, say, parent_ts, channel_id,
                                                 _resolve_event_files(event, channel_id))
@@ -2868,26 +2887,29 @@ def handle_message(event, say):
                 logger.info("Thread reply: session found thread=%s claude_session_id=%s tasks=%d active=%s",
                             parent_ts, session.claude_session_id[:16] if session.claude_session_id else "None",
                             len(session.tasks), session.active_task is not None)
-                input_text = _strip_bot_mention(text)
+                stripped = _strip_bot_mention(text)
+                is_mentioned = (stripped != text)
+                input_text = stripped if is_mentioned else text
                 if not input_text:
-                    input_text = text  # メンションなくてもOK
-                # コマンド判定（toolsコマンドはスレッド内で有効）
-                cmd_lower = input_text.lower()
-                if cmd_lower.startswith("tools "):
-                    tools = input_text[6:].strip()
-                    session.next_tools = tools
-                    say(
-                        text=t("tools_set", tools=tools),
-                        thread_ts=parent_ts,
-                    )
-                    return
-                if cmd_lower.startswith("cancel"):
-                    _handle_cancel(input_text, say, parent_ts, channel_id)
-                    return
-                if cmd_lower == "status":
-                    _handle_status(say, parent_ts, channel_id)
-                    return
-                # 新タスクとして --resume 続行
+                    input_text = text  # メンションのみの場合は元テキストを使用
+                # コマンド判定（メンション付きの場合のみ）
+                if is_mentioned:
+                    cmd_lower = input_text.lower()
+                    if cmd_lower.startswith("tools "):
+                        tools = input_text[6:].strip()
+                        session.next_tools = tools
+                        say(
+                            text=t("tools_set", tools=tools),
+                            thread_ts=parent_ts,
+                        )
+                        return
+                    if cmd_lower.startswith("cancel"):
+                        _handle_cancel(input_text, say, parent_ts, channel_id)
+                        return
+                    if cmd_lower == "status":
+                        _handle_status(say, parent_ts, channel_id)
+                        return
+                # 新タスクとして --resume 続行（メンション有無問わず）
                 resolved_files = _resolve_event_files(event, channel_id)
                 _handle_thread_reply_task(
                     input_text, project, session, say, parent_ts, user_id, resolved_files
