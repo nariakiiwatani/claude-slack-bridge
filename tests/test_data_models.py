@@ -31,6 +31,11 @@ class TestTask:
         assert task.process is None
         assert task.master_fd is None
         assert task.resume_session is None
+        assert task.disallowed_tools is None
+
+    def test_disallowed_tools_explicit(self, make_task):
+        task = make_task(disallowed_tools="AskUserQuestion")
+        assert task.disallowed_tools == "AskUserQuestion"
 
 
 # ── Session ───────────────────────────────────────────────

@@ -494,6 +494,7 @@ class Task:
     completed_at: Optional[datetime] = None
     tool_calls: list = field(default_factory=list)
     allowed_tools: Optional[str] = None
+    disallowed_tools: Optional[str] = None  # None=デフォルト(AskUserQuestion,ExitPlanMode), 明示値で上書き
     user_id: Optional[str] = None
 
     # プロセス管理（実行中のみ）
@@ -1169,6 +1170,7 @@ def _monitor_session_jsonl(inst: dict, thread_ts: str, channel: str, client: Web
                 "question": q.get("question", ""),
                 "options": q["options"],
                 "multi_select": q["multi_select"],
+                "is_plan_approval": q.get("is_plan_approval", False),
             }
             inst["pending_question"] = pq
             # Sessionにも保存（プロセス終了後の --resume 用）
@@ -1188,6 +1190,9 @@ def _monitor_session_jsonl(inst: dict, thread_ts: str, channel: str, client: Web
                 )
             except Exception as e:
                 logger.error("Plan file upload error PID %d: %s", pid, e)
+        # プラン承認マーカーをmetadataに追加（_post_question→pending_questionに伝播）
+        if metadata and metadata.get("questions"):
+            metadata["questions"][0]["is_plan_approval"] = True
         _post_question(question_text, metadata)
 
     while _is_process_alive(pid):
@@ -2304,9 +2309,14 @@ class ClaudeCodeRunner:
         if tools:
             cmd.extend(["--allowedTools", tools])
 
-        # AskUserQuestionは-pモードでは自動回答されユーザー入力を待てないため無効化。
-        # 質問はテキスト出力→プロセス終了→ユーザー返信→--resumeで継続する。
-        cmd.extend(["--disallowedTools", "AskUserQuestion"])
+        # disallowedTools: タスクに明示指定があればそれを使用、なければデフォルト。
+        # デフォルトではAskUserQuestion（-pモードで自動回答されるため）と
+        # ExitPlanMode（プラン承認フローのため）を無効化。
+        # プラン承認後はtask.disallowed_tools="AskUserQuestion"が設定され、
+        # ExitPlanModeが許可される。
+        disallowed = task.disallowed_tools if task.disallowed_tools is not None else "AskUserQuestion,ExitPlanMode"
+        if disallowed:
+            cmd.extend(["--disallowedTools", disallowed])
         cmd.extend(["--append-system-prompt", t("prompt_system_append")])
 
         if task.resume_session:
@@ -2906,6 +2916,9 @@ def _handle_thread_reply_task(prompt: str, project: Project, session: Session,
     """スレッド返信を --resume で新タスクとして実行"""
     # pending_question がある場合、回答を質問コンテキスト付きプロンプトに変換
     pq = session.pending_question
+    is_plan_approval = pq.get("is_plan_approval", False) if pq else False
+    plan_approved = False
+
     if pq and not pq.get("multi_select", False):
         options = pq.get("options", [])
         question_text = pq.get("question", "")
@@ -2915,9 +2928,13 @@ def _handle_thread_reply_task(prompt: str, project: Project, session: Session,
             if 1 <= num <= len(options):
                 label = options[num - 1].get("label", prompt)
                 prompt = _build_question_answer_prompt(question_text, options, num, label)
+                # プラン承認: 選択肢1 = 承認
+                if is_plan_approval and num == 1:
+                    plan_approved = True
         else:
             # テキスト回答の場合もコンテキスト付与
             prompt = _build_question_answer_prompt(question_text, options, None, prompt)
+            # テキスト回答 = フィードバック（却下扱い）
         session.pending_question = None
 
     # 添付ファイルのダウンロードとプロンプト拡張
@@ -2938,10 +2955,17 @@ def _handle_thread_reply_task(prompt: str, project: Project, session: Session,
         else:
             logger.warning("_handle_thread_reply_task: session_id not acquired after 3s wait thread=%s", thread_ts)
 
+    # disallowed_tools の決定: プラン承認時はExitPlanModeを許可
+    disallowed = None  # デフォルト: AskUserQuestion,ExitPlanMode 両方無効
+    if plan_approved:
+        disallowed = "AskUserQuestion"  # ExitPlanModeを許可
+        logger.info("_handle_thread_reply_task: plan approved, allowing ExitPlanMode thread=%s", thread_ts)
+
     task = Task(
         id=0,
         prompt=prompt,
         allowed_tools=session.consume_tools(),
+        disallowed_tools=disallowed,
         user_id=user_id,
     )
     # セッションにclaude_session_idがあれば自動で --resume
@@ -3321,6 +3345,12 @@ def _help_text() -> str:
     return t("help_text")
 
 
+def _slack_thread_link(channel_id: str, thread_ts: str) -> str:
+    """Slackスレッドへのリンクを生成"""
+    ts_no_dot = thread_ts.replace(".", "")
+    return f"https://app.slack.com/archives/{channel_id}/p{ts_no_dot}"
+
+
 def _handle_status(say, thread_ts, channel_id: str):
     """プロジェクトスコープのタスク状態一覧"""
     project = runner.get_project(channel_id)
@@ -3331,6 +3361,11 @@ def _handle_status(say, thread_ts, channel_id: str):
     active_sessions = project.active_sessions
     if not active_sessions:
         # 直近の完了タスクを表示
+        # タスク→セッションのマッピングを構築
+        task_session_map: dict[int, Session] = {}
+        for session in project.sessions.values():
+            for tk in session.tasks:
+                task_session_map[tk.id] = session
         all_tasks = project.all_tasks
         recent = [tk for tk in all_tasks if tk.status in (TaskStatus.COMPLETED, TaskStatus.FAILED, TaskStatus.CANCELLED)][-5:]
         if recent:
@@ -3340,7 +3375,12 @@ def _handle_status(say, thread_ts, channel_id: str):
                 elapsed_str = ""
                 if tk.started_at and tk.completed_at:
                     elapsed_str = " " + t("status_elapsed_seconds", elapsed=(tk.completed_at - tk.started_at).total_seconds())
-                lines.append(f"{emoji} {tk.short_id} {tk.prompt[:40]}{elapsed_str}")
+                session = task_session_map.get(tk.id)
+                thread_link = ""
+                if session:
+                    link_url = _slack_thread_link(channel_id, session.thread_ts)
+                    thread_link = f"  <{link_url}|:speech_balloon:>"
+                lines.append(f"{emoji} {tk.short_id} {tk.prompt[:40]}{elapsed_str}{thread_link}")
             say(text="\n".join(lines), thread_ts=thread_ts)
         else:
             say(text=t("status_no_running_tasks"), thread_ts=thread_ts)
@@ -3356,9 +3396,11 @@ def _handle_status(say, thread_ts, channel_id: str):
         tool_count = len(task.tool_calls)
 
         user_info = f"  <@{task.user_id}>" if task.user_id else ""
+        thread_link_url = _slack_thread_link(channel_id, session.thread_ts)
+        thread_link = f"  <{thread_link_url}|:speech_balloon:>"
         lines.append(
             f"\n{session.label_emoji} {task.short_id}"
-            f"  {t('status_elapsed_tools', elapsed=elapsed, tool_count=tool_count)}{user_info}\n"
+            f"  {t('status_elapsed_tools', elapsed=elapsed, tool_count=tool_count)}{user_info}{thread_link}\n"
             f"> {prompt_preview}"
         )
         if task.tool_calls:
@@ -3564,9 +3606,11 @@ def _handle_sessions(say, thread_ts, channel_id: str):
         latest = session.latest_task
         prompt_preview = latest.prompt[:40] + ("..." if latest and len(latest.prompt) > 40 else "") if latest else ""
 
+        thread_link_url = _slack_thread_link(channel_id, session.thread_ts)
+        thread_link = f"<{thread_link_url}|:speech_balloon:>"
         lines.append(
             f"{status_emoji} {session.label_emoji} `{sid}` {t('session_task_count', count=task_count)}"
-            f" :file_folder:`{dir_name}` {prompt_preview}"
+            f" :file_folder:`{dir_name}` {prompt_preview} {thread_link}"
         )
 
     lines.append(t("session_reply_to_continue"))

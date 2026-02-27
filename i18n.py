@@ -170,6 +170,9 @@ MESSAGES: dict[str, dict[str, str]] = {
             "質問を出力したら、その場で応答を終了してください。"
             "ユーザーは次のメッセージで回答します。"
             "質問の回答を待たずに処理を進めないでください。"
+            "プランモードを終了する場合は、ExitPlanModeツールを使わず、"
+            "プラン内容をテキストで出力してください。"
+            "ユーザーがプランを承認した後、次のメッセージで実行を開始します。"
         ),
     },
     "en": {
@@ -335,7 +338,10 @@ MESSAGES: dict[str, dict[str, str]] = {
             "do not use the AskUserQuestion tool. Instead, output your question as text. "
             "After outputting the question, end your response immediately. "
             "The user will answer in the next message. "
-            "Do not proceed without waiting for the answer."
+            "Do not proceed without waiting for the answer. "
+            "When exiting plan mode, do not use the ExitPlanMode tool. "
+            "Instead, output your plan as text. "
+            "The user will approve the plan, and execution will begin in the next message."
         ),
     },
 }

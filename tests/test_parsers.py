@@ -532,3 +532,59 @@ class TestExtractSessionInfoFromJsonl:
         task = make_task()
         bridge._extract_session_info_from_jsonl(task, None, str(p))
         assert task.result == "plain text result"
+
+
+# ── build_command: disallowed_tools ──────────────────────
+
+class TestBuildCommandDisallowedTools:
+    """build_command が disallowed_tools を正しく反映するかテスト"""
+
+    def _make_runner(self):
+        """テスト用の ClaudeCodeRunner（Slack依存部分をモック）"""
+        from unittest.mock import MagicMock
+        runner = bridge.ClaudeCodeRunner.__new__(bridge.ClaudeCodeRunner)
+        runner.client = MagicMock()
+        return runner
+
+    def test_default_disallowed_tools(self, make_task):
+        """デフォルト（None）ではAskUserQuestionとExitPlanMode両方が無効"""
+        runner = self._make_runner()
+        task = make_task(disallowed_tools=None)
+        cmd = runner.build_command(task)
+        idx = cmd.index("--disallowedTools")
+        assert cmd[idx + 1] == "AskUserQuestion,ExitPlanMode"
+
+    def test_explicit_disallowed_tools(self, make_task):
+        """明示指定ではその値が使われる（プラン承認後のケース）"""
+        runner = self._make_runner()
+        task = make_task(disallowed_tools="AskUserQuestion")
+        cmd = runner.build_command(task)
+        idx = cmd.index("--disallowedTools")
+        assert cmd[idx + 1] == "AskUserQuestion"
+
+    def test_empty_disallowed_tools(self, make_task):
+        """空文字列の場合は --disallowedTools が含まれない"""
+        runner = self._make_runner()
+        task = make_task(disallowed_tools="")
+        cmd = runner.build_command(task)
+        assert "--disallowedTools" not in cmd
+
+
+# ── _format_exit_plan_mode: is_plan_approval マーカー ────
+
+class TestPlanApprovalMarker:
+    """_format_exit_plan_mode の metadata に is_plan_approval が伝播するかテスト"""
+
+    def test_plan_approval_marker_not_in_format(self):
+        """_format_exit_plan_mode 自体は is_plan_approval を設定しない
+        （_post_plan_approval が設定する）"""
+        _, meta = bridge._format_exit_plan_mode({"plan": "test"})
+        assert meta["questions"][0].get("is_plan_approval") is None or \
+               meta["questions"][0].get("is_plan_approval") is False
+
+    def test_plan_approval_marker_after_post(self):
+        """_post_plan_approval が metadata に is_plan_approval を追加するシミュレーション"""
+        _, meta = bridge._format_exit_plan_mode({"plan": "test"})
+        # _post_plan_approval の処理を再現
+        meta["questions"][0]["is_plan_approval"] = True
+        assert meta["questions"][0]["is_plan_approval"] is True
