@@ -9,6 +9,9 @@ PROJECT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 
 cd "$PROJECT_DIR"
 
+# LaunchAgentはPATHが最小限のため、ユーザー環境の一般的なパスを追加
+export PATH="$HOME/.local/bin:$HOME/.nodenv/shims:$HOME/.nvm/versions/node/*/bin:/usr/local/bin:/opt/homebrew/bin:$PATH"
+
 # venv有効化
 if [ -f "venv/bin/activate" ]; then
     source venv/bin/activate

@@ -2139,20 +2139,23 @@ class ClaudeCodeRunner:
                 proc.stdin.write(task.prompt)
                 proc.stdin.close()
 
-            # JONLファイルが現れるまでポーリング
+            # JONLファイルが現れるまでポーリング（プロセス終了まで探し続ける）
+            # resumeタスクの場合、既存JSONLのbirthtimeはstart_timeより古いため
+            # min_ctimeなしでも検索する
             jsonl_path = None
-            for poll_i in range(30):
-                if proc.poll() is not None:
-                    logger.debug("_execute: process exited during JSONL polling pid=%d poll=%d thread=%s", proc.pid, poll_i, thread_ts)
-                    break
+            poll_i = 0
+            while proc.poll() is None:
                 found = _find_session_jsonl(cwd, min_ctime=start_time)
+                if not found and is_resume:
+                    found = _find_session_jsonl(cwd, min_mtime=start_time)
                 if found:
                     jsonl_path = found
                     logger.debug("_execute: JSONL file found path=%s poll=%d thread=%s", found, poll_i, thread_ts)
                     break
+                poll_i += 1
                 time.sleep(1)
-            else:
-                logger.warning("_execute: JSONL file not found within 30s pid=%d cwd=%s thread=%s", proc.pid, cwd, thread_ts)
+            if not jsonl_path:
+                logger.warning("_execute: JSONL file not found (process exited) pid=%d cwd=%s thread=%s", proc.pid, cwd, thread_ts)
 
             # JSONL監視（プロセスがまだ実行中の場合）
             jsonl_monitored = False
@@ -2189,7 +2192,7 @@ class ClaudeCodeRunner:
 
             # JSONL からsession_idを取得できなかった場合のフォールバック
             if not session.claude_session_id:
-                fallback_path = jsonl_path or _find_session_jsonl(cwd, min_ctime=start_time)
+                fallback_path = jsonl_path or _find_session_jsonl(cwd, min_ctime=start_time) or (is_resume and _find_session_jsonl(cwd, min_mtime=start_time))
                 logger.debug("_execute: session_id not acquired, trying fallback fallback_path=%s jsonl_monitored=%s pid=%d thread=%s",
                              fallback_path, jsonl_monitored, proc.pid, thread_ts)
                 if fallback_path:
