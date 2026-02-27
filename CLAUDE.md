@@ -15,11 +15,21 @@ Tasks are started with a directory specified at invocation time via three method
 
 ## Running
 
+The bridge runs as a macOS LaunchAgent (`com.user.claude-slack-bridge`). Use `scripts/install.sh` for initial setup.
+
 ```bash
-source venv/bin/activate
-pip install -r requirements.txt
-python bridge.py
+# Restart (stop + start via launchctl)
+launchctl bootout gui/$(id -u)/com.user.claude-slack-bridge
+launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.user.claude-slack-bridge.plist
+
+# Status
+launchctl print gui/$(id -u)/com.user.claude-slack-bridge
+
+# Logs
+tail -f ~/Library/Logs/claude-slack-bridge/stderr.log
 ```
+
+Do NOT start bridge.py directly with `python bridge.py` — always use launchctl.
 
 Configuration is in `.env` (copy from `.env.example`). Required: `SLACK_BOT_TOKEN`, `SLACK_APP_TOKEN`, `ADMIN_SLACK_USER_ID`. Optional: `SLACK_ALLOWED_USERS`, `SLACK_ALLOWED_CHANNELS`, `NOTIFICATION_CHANNEL`, `CLAUDE_CMD`, `DEFAULT_ALLOWED_TOOLS`, `LOG_LEVEL`.
 
