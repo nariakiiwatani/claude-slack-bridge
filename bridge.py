@@ -2126,7 +2126,13 @@ class ClaudeCodeRunner:
             # 永続化セッションを復元
             saved = self.load_sessions()
             if channel_id in saved:
+                logger.info("get_or_create_project: restoring %d sessions for channel=%s",
+                            len(saved[channel_id]), channel_id)
                 self._restore_sessions(project, saved[channel_id])
+                logger.info("get_or_create_project: after restore, project has %d sessions: %s",
+                            len(project.sessions), list(project.sessions.keys()))
+            else:
+                logger.info("get_or_create_project: no saved sessions for channel=%s", channel_id)
             self.projects[channel_id] = project
         return self.projects[channel_id]
 
@@ -2256,9 +2262,12 @@ class ClaudeCodeRunner:
         """永続化データからSessionオブジェクトをProjectに復元"""
         now = datetime.now()
         cutoff = now - timedelta(days=SESSIONS_MAX_AGE_DAYS)
+        restored_count = 0
+        skipped_reasons: dict[str, list[str]] = {"in_memory": [], "expired": []}
         for thread_ts, sdata in channel_data.items():
             # 既にメモリにあるセッションは上書きしない
             if thread_ts in project.sessions:
+                skipped_reasons["in_memory"].append(thread_ts)
                 continue
             # 古いセッションは復元スキップ
             created_at_str = sdata.get("created_at")
@@ -2268,6 +2277,7 @@ class ClaudeCodeRunner:
                 except (ValueError, TypeError):
                     created_at = now
                 if created_at < cutoff:
+                    skipped_reasons["expired"].append(thread_ts)
                     continue
             else:
                 created_at = now
@@ -2281,6 +2291,11 @@ class ClaudeCodeRunner:
                 created_at=created_at,
             )
             project.sessions[thread_ts] = session
+            restored_count += 1
+        if skipped_reasons["in_memory"] or skipped_reasons["expired"]:
+            logger.info("_restore_sessions: restored=%d skipped_in_memory=%d skipped_expired=%d channel=%s",
+                        restored_count, len(skipped_reasons["in_memory"]), len(skipped_reasons["expired"]),
+                        project.channel_id)
 
     def get_channel_root(self, channel_id: str) -> Optional[str]:
         """チャンネルのルートディレクトリを取得"""
@@ -2342,6 +2357,8 @@ class ClaudeCodeRunner:
         return None
 
     def _execute(self, project: Project, session: Session, task: Task):
+        logger.info("_execute: starting task=%s thread=%s resume=%s cwd=%s",
+                    task.short_id, session.thread_ts, task.resume_session[:16] if task.resume_session else "None", session.working_dir)
         cwd = session.working_dir
         if not cwd:
             # Safety net（新フローでは到達しないはず）
@@ -2520,6 +2537,8 @@ class ClaudeCodeRunner:
             else:
                 logger.debug("_execute: task completed session_id=%s thread=%s", session.claude_session_id[:16], thread_ts)
 
+            logger.info("_execute: process finished pid=%d returncode=%d thread=%s",
+                       proc.pid, proc.returncode, thread_ts)
             if proc.returncode == 0:
                 task.status = TaskStatus.COMPLETED
                 task.completed_at = datetime.now()
@@ -2545,6 +2564,7 @@ class ClaudeCodeRunner:
             self._cleanup_status_message(inst, session, task)
 
         except Exception as e:
+            logger.error("_execute: exception in task thread=%s error=%s", thread_ts, e, exc_info=True)
             task.status = TaskStatus.FAILED
             task.error = str(e)
             task.completed_at = datetime.now()
@@ -2806,14 +2826,18 @@ def handle_message(event, say):
 
         # スレッド返信の処理
         if parent_ts:
+            logger.info("Thread reply received: thread=%s user=%s text_len=%d channel=%s",
+                        parent_ts, user_id, len(text), channel_id)
             # 1. instance_threads に登録あり & アクティブタスク実行中 → PTY に入力転送
             if parent_ts in instance_threads:
+                logger.info("Thread reply: routing to instance_threads (PTY) thread=%s", parent_ts)
                 input_text = _strip_bot_mention(text)
                 input_text = "/" + input_text[1:] if input_text.startswith("!") else input_text
                 handled = _handle_instance_input(input_text, say, parent_ts, channel_id,
                                                 _resolve_event_files(event, channel_id))
                 if handled:
                     return
+                logger.info("Thread reply: instance_input returned False (EIO), falling through thread=%s", parent_ts)
                 # EIOでFalse返却 → instance_threads除去済み、セッション --resume パスへフォールスルー
 
             # 1.5. ディレクトリ選択待ち → 選択処理
@@ -2828,10 +2852,12 @@ def handle_message(event, say):
             #    get_or_create_project を使い、再起動後も sessions.json から復元する
             project = runner.get_or_create_project(channel_id)
             session = project.sessions.get(parent_ts)
+            logger.info("Thread reply: session lookup thread=%s found=%s project_sessions=%d",
+                        parent_ts, session is not None, len(project.sessions))
             if session:
-                logger.debug("Thread reply: session found thread=%s claude_session_id=%s tasks=%d active=%s",
-                             parent_ts, session.claude_session_id[:16] if session.claude_session_id else "None",
-                             len(session.tasks), session.active_task is not None)
+                logger.info("Thread reply: session found thread=%s claude_session_id=%s tasks=%d active=%s",
+                            parent_ts, session.claude_session_id[:16] if session.claude_session_id else "None",
+                            len(session.tasks), session.active_task is not None)
                 input_text = _strip_bot_mention(text)
                 if not input_text:
                     input_text = text  # メンションなくてもOK
@@ -2862,12 +2888,12 @@ def handle_message(event, say):
             stripped = _strip_bot_mention(text)
             if stripped != text:
                 # メンション付きスレッド返信 → コマンドとして処理
-                logger.debug("Thread reply: session not found, processing as mentioned command thread=%s channel=%s",
-                             parent_ts, channel_id)
+                logger.info("Thread reply: session NOT found, processing as mentioned command thread=%s channel=%s",
+                            parent_ts, channel_id)
                 _dispatch_command(stripped, event, say)
             else:
-                logger.debug("Thread reply: session not found and no mention, ignoring thread=%s channel=%s",
-                             parent_ts, channel_id)
+                logger.info("Thread reply: session NOT found and no mention, IGNORING thread=%s channel=%s",
+                            parent_ts, channel_id)
             return
 
         # フォーク選択割り込み（メンション有無問わず、番号 or cancel のみ処理）
@@ -2971,12 +2997,15 @@ def _handle_thread_reply_task(prompt: str, project: Project, session: Session,
     # セッションにclaude_session_idがあれば自動で --resume
     if session.claude_session_id:
         task.resume_session = session.claude_session_id
-        logger.debug("_handle_thread_reply_task: creating task with --resume sid=%s thread=%s", session.claude_session_id[:16], thread_ts)
+        logger.info("_handle_thread_reply_task: creating task with --resume sid=%s thread=%s", session.claude_session_id[:16], thread_ts)
     else:
         logger.warning("_handle_thread_reply_task: no session_id, running new task without --resume thread=%s", thread_ts)
 
+    logger.info("_handle_thread_reply_task: calling run_task thread=%s resume=%s disallowed=%s",
+                thread_ts, task.resume_session[:16] if task.resume_session else "None", task.disallowed_tools)
     err = runner.run_task(project, session, task)
     if err:
+        logger.warning("_handle_thread_reply_task: run_task returned error=%s thread=%s", err, thread_ts)
         say(text=err, thread_ts=thread_ts)
 
 

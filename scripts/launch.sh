@@ -37,4 +37,19 @@ else
     exit 1
 fi
 
+# 既存のbridge.pyプロセスを検出・終了（orphan対策）
+existing_pids=$(pgrep -f "python.*bridge\.py" 2>/dev/null || true)
+if [ -n "$existing_pids" ]; then
+    echo "Killing stale bridge process(es): $existing_pids" >&2
+    echo "$existing_pids" | xargs kill 2>/dev/null || true
+    sleep 1
+    # SIGKILLフォールバック
+    remaining=$(pgrep -f "python.*bridge\.py" 2>/dev/null || true)
+    if [ -n "$remaining" ]; then
+        echo "Force-killing remaining process(es): $remaining" >&2
+        echo "$remaining" | xargs kill -9 2>/dev/null || true
+        sleep 1
+    fi
+fi
+
 exec python bridge.py
