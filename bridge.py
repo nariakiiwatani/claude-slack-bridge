@@ -731,16 +731,18 @@ def _is_process_alive(pid: int) -> bool:
 
 
 # ── セッションJSONL監視 ──────────────────────────────────
-def _find_session_jsonl(cwd: str, min_mtime: float = 0, min_ctime: float = 0) -> Optional[str]:
+def _find_session_jsonl(cwd: str, min_mtime: float = 0, min_ctime: float = 0, exclude_paths: set[str] | None = None) -> Optional[str]:
     """CWDからclaude CLIのセッションJSONLファイルパスを特定。
     JONLファイル内のcwdフィールドで逆引きマッチする。
-    min_ctime: ファイル作成時刻(st_birthtime)がこの値以降のもののみ対象（macOS用）。"""
+    min_ctime: ファイル作成時刻(st_birthtime)がこの値以降のもののみ対象（macOS用）。
+    exclude_paths: 除外するファイルパスのセット（重複監視防止用）。"""
     if not cwd or cwd == "(unknown)":
         return None
     projects_base = Path.home() / ".claude" / "projects"
     if not projects_base.is_dir():
         return None
-    # 全プロジェクトディレクトリ内の最新.jsonlファイルからcwdが一致するものを探す
+    # 全プロジェクトディレクトリ内のjsonlファイルからcwdが一致するものを探す
+    # mtime降順でソートし、exclude_pathsに含まれないものを優先的に採用
     best_path: Optional[str] = None
     best_mtime: float = 0
     for proj_dir in projects_base.iterdir():
@@ -755,34 +757,41 @@ def _find_session_jsonl(cwd: str, min_mtime: float = 0, min_ctime: float = 0) ->
                            if getattr(f.stat(), 'st_birthtime', f.stat().st_mtime) >= min_ctime]
             if not jsonl_files:
                 continue
-        # 最新のjsonlを候補にする
-        latest = max(jsonl_files, key=lambda f: f.stat().st_mtime)
-        mtime = latest.stat().st_mtime
-        # JONLの先頭数行からcwdを確認（file-history-snapshot等はcwdなし）
-        try:
-            matched = False
-            with open(latest, "r", encoding="utf-8") as f:
-                for i, line in enumerate(f):
-                    if i >= 5:
-                        break
-                    line = line.strip()
-                    if not line:
-                        continue
-                    try:
-                        entry = json.loads(line)
-                    except json.JSONDecodeError:
-                        continue
-                    entry_cwd = entry.get("cwd", "")
-                    if entry_cwd == cwd:
-                        matched = True
-                        break
-                    elif entry_cwd:
-                        break  # 別のcwdなので不一致
-            if matched and mtime > best_mtime and mtime >= min_mtime:
-                best_mtime = mtime
-                best_path = str(latest)
-        except OSError:
-            continue
+        # mtime降順でソートし、候補を順番に検査
+        jsonl_files.sort(key=lambda f: f.stat().st_mtime, reverse=True)
+        for latest in jsonl_files:
+            fpath = str(latest)
+            if exclude_paths and fpath in exclude_paths:
+                continue
+            mtime = latest.stat().st_mtime
+            if mtime < min_mtime:
+                break  # 以降はさらに古いのでスキップ
+            # JONLの先頭数行からcwdを確認（file-history-snapshot等はcwdなし）
+            try:
+                matched = False
+                with open(latest, "r", encoding="utf-8") as f:
+                    for i, line in enumerate(f):
+                        if i >= 5:
+                            break
+                        line = line.strip()
+                        if not line:
+                            continue
+                        try:
+                            entry = json.loads(line)
+                        except json.JSONDecodeError:
+                            continue
+                        entry_cwd = entry.get("cwd", "")
+                        if entry_cwd == cwd:
+                            matched = True
+                            break
+                        elif entry_cwd:
+                            break  # 別のcwdなので不一致
+                if matched and mtime > best_mtime:
+                    best_mtime = mtime
+                    best_path = fpath
+                    break  # このプロジェクトディレクトリ内で最適な候補が見つかった
+            except OSError:
+                continue
     return best_path
 
 
@@ -1194,7 +1203,7 @@ def _monitor_session_jsonl(inst: dict, thread_ts: str, channel: str, client: Web
         # JONLファイルが変わった可能性をチェック（外部インスタンス用）
         if not fixed_jsonl:
             cwd = inst.get("cwd", "")
-            new_path = _find_session_jsonl(cwd)
+            new_path = _find_session_jsonl(cwd, exclude_paths=_monitored_jsonl_paths)
             if new_path and new_path != jsonl_path:
                 _finalize_progress()
                 jsonl_path = new_path
@@ -2344,6 +2353,7 @@ class ClaudeCodeRunner:
         use_pty = len(prompt_bytes) <= 200 * 1024
         master_fd = None
         registered_thread_ts = None
+        jsonl_path = None
 
         try:
             # サブプロセス起動前のタイムスタンプを記録（JSONL検出用）
@@ -2413,13 +2423,14 @@ class ClaudeCodeRunner:
             jsonl_is_existing = False  # resume時に既存ファイルが見つかった場合True
             poll_i = 0
             while proc.poll() is None:
-                found = _find_session_jsonl(cwd, min_ctime=start_time)
+                found = _find_session_jsonl(cwd, min_ctime=start_time, exclude_paths=_monitored_jsonl_paths)
                 if not found and is_resume:
-                    found = _find_session_jsonl(cwd, min_mtime=start_time)
+                    found = _find_session_jsonl(cwd, min_mtime=start_time, exclude_paths=_monitored_jsonl_paths)
                     if found:
                         jsonl_is_existing = True
                 if found:
                     jsonl_path = found
+                    _monitored_jsonl_paths.add(jsonl_path)
                     logger.debug("_execute: JSONL file found path=%s poll=%d existing=%s thread=%s", found, poll_i, jsonl_is_existing, thread_ts)
                     break
                 poll_i += 1
@@ -2465,7 +2476,7 @@ class ClaudeCodeRunner:
 
             # JSONL からsession_idを取得できなかった場合のフォールバック
             if not session.claude_session_id:
-                fallback_path = jsonl_path or _find_session_jsonl(cwd, min_ctime=start_time) or (is_resume and _find_session_jsonl(cwd, min_mtime=start_time))
+                fallback_path = jsonl_path or _find_session_jsonl(cwd, min_ctime=start_time, exclude_paths=_monitored_jsonl_paths) or (is_resume and _find_session_jsonl(cwd, min_mtime=start_time, exclude_paths=_monitored_jsonl_paths))
                 logger.debug("_execute: session_id not acquired, trying fallback fallback_path=%s jsonl_monitored=%s pid=%d thread=%s",
                              fallback_path, jsonl_monitored, proc.pid, thread_ts)
                 if fallback_path:
@@ -2509,6 +2520,8 @@ class ClaudeCodeRunner:
             self._post_to_session(session, f"{display_label}  {t('task_error', error=e)}")
 
         finally:
+            if jsonl_path:
+                _monitored_jsonl_paths.discard(jsonl_path)
             if master_fd is not None:
                 try:
                     os.close(master_fd)
@@ -2654,6 +2667,9 @@ runner = ClaudeCodeRunner(slack_client)
 # スレッドts → インスタンス情報のマッピング（起動時に検出したclaude CLIプロセス用）
 instance_threads: dict[str, dict] = {}
 
+# 現在監視中のJSONLファイルパス（重複監視防止）
+_monitored_jsonl_paths: set[str] = {}
+
 # fork の複数候補選択状態（channel_id → 選択情報）
 pending_fork_selections: dict[str, dict] = {}
 
@@ -2736,49 +2752,49 @@ def handle_message(event, say):
                     return
 
             # 2. セッション存在 → --resume で新タスク自動作成（メンション不要）
-            project = runner.get_project(channel_id)
-            if project:
-                session = project.sessions.get(parent_ts)
-                if session:
-                    logger.debug("Thread reply: session found thread=%s claude_session_id=%s tasks=%d active=%s",
-                                 parent_ts, session.claude_session_id[:16] if session.claude_session_id else "None",
-                                 len(session.tasks), session.active_task is not None)
-                    input_text = _strip_bot_mention(text)
-                    if not input_text:
-                        input_text = text  # メンションなくてもOK
-                    # コマンド判定（toolsコマンドはスレッド内で有効）
-                    cmd_lower = input_text.lower()
-                    if cmd_lower.startswith("tools "):
-                        tools = input_text[6:].strip()
-                        session.next_tools = tools
-                        say(
-                            text=t("tools_set", tools=tools),
-                            thread_ts=parent_ts,
-                        )
-                        return
-                    if cmd_lower.startswith("cancel"):
-                        _handle_cancel(input_text, say, parent_ts, channel_id)
-                        return
-                    if cmd_lower == "status":
-                        _handle_status(say, parent_ts, channel_id)
-                        return
-                    # 新タスクとして --resume 続行
-                    resolved_files = _resolve_event_files(event, channel_id)
-                    _handle_thread_reply_task(
-                        input_text, project, session, say, parent_ts, user_id, resolved_files
+            #    get_or_create_project を使い、再起動後も sessions.json から復元する
+            project = runner.get_or_create_project(channel_id)
+            session = project.sessions.get(parent_ts)
+            if session:
+                logger.debug("Thread reply: session found thread=%s claude_session_id=%s tasks=%d active=%s",
+                             parent_ts, session.claude_session_id[:16] if session.claude_session_id else "None",
+                             len(session.tasks), session.active_task is not None)
+                input_text = _strip_bot_mention(text)
+                if not input_text:
+                    input_text = text  # メンションなくてもOK
+                # コマンド判定（toolsコマンドはスレッド内で有効）
+                cmd_lower = input_text.lower()
+                if cmd_lower.startswith("tools "):
+                    tools = input_text[6:].strip()
+                    session.next_tools = tools
+                    say(
+                        text=t("tools_set", tools=tools),
+                        thread_ts=parent_ts,
                     )
                     return
+                if cmd_lower.startswith("cancel"):
+                    _handle_cancel(input_text, say, parent_ts, channel_id)
+                    return
+                if cmd_lower == "status":
+                    _handle_status(say, parent_ts, channel_id)
+                    return
+                # 新タスクとして --resume 続行
+                resolved_files = _resolve_event_files(event, channel_id)
+                _handle_thread_reply_task(
+                    input_text, project, session, say, parent_ts, user_id, resolved_files
+                )
+                return
 
             # フォールバック: メンション付きならコマンドとして処理
             stripped = _strip_bot_mention(text)
             if stripped != text:
                 # メンション付きスレッド返信 → コマンドとして処理
-                logger.debug("Thread reply: session not found, processing as mentioned command thread=%s channel=%s project=%s",
-                             parent_ts, channel_id, project is not None)
+                logger.debug("Thread reply: session not found, processing as mentioned command thread=%s channel=%s",
+                             parent_ts, channel_id)
                 _dispatch_command(stripped, event, say)
             else:
-                logger.debug("Thread reply: session not found and no mention, ignoring thread=%s channel=%s project=%s",
-                             parent_ts, channel_id, project is not None)
+                logger.debug("Thread reply: session not found and no mention, ignoring thread=%s channel=%s",
+                             parent_ts, channel_id)
             return
 
         # フォーク選択割り込み（メンション有無問わず、番号 or cancel のみ処理）
