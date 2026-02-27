@@ -18,6 +18,9 @@ channel_projects.json
 # Directory history
 directory_history.json
 
+# Session persistence
+sessions.json
+
 # Channel root directories
 channel_roots.json
 

@@ -44,7 +44,7 @@ import urllib.request
 import urllib.error
 from dataclasses import dataclass, field
 from urllib.parse import urlparse
-from datetime import datetime
+from datetime import datetime, timedelta
 from enum import Enum
 from pathlib import Path
 from typing import Optional
@@ -92,6 +92,9 @@ MAX_SLACK_FILE_SIZE = 20 * 1024 * 1024  # 20MB
 DIRECTORY_HISTORY_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "directory_history.json")
 CHANNEL_ROOTS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "channel_roots.json")
 DIRECTORY_HISTORY_MAX = 10
+SESSIONS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "sessions.json")
+SESSIONS_MAX_AGE_DAYS = 7
+SESSIONS_MAX_PER_CHANNEL = 50
 
 
 # ---------------------------------------------------------------------------
@@ -986,6 +989,7 @@ def _monitor_session_jsonl(inst: dict, thread_ts: str, channel: str, client: Web
         if sid and session_ref:
             logger.debug("JSONL monitor: session_id acquired sid=%s thread=%s", sid[:16] if sid else None, thread_ts)
             session_ref.claude_session_id = sid
+            runner.save_sessions()
         if not task_ref:
             return
         # result type
@@ -1244,6 +1248,7 @@ def _extract_session_info_from_jsonl(task: Task, session: Optional["Session"], j
                 if sid:
                     if session:
                         session.claude_session_id = sid
+                        runner.save_sessions()
                 # result
                 if entry_type == "result":
                     result_data = entry.get("result", {})
@@ -1926,7 +1931,12 @@ class ClaudeCodeRunner:
         if channel_id not in self.projects:
             roots = self.load_channel_roots()
             root_dir = roots.get(channel_id)
-            self.projects[channel_id] = Project(channel_id=channel_id, root_dir=root_dir)
+            project = Project(channel_id=channel_id, root_dir=root_dir)
+            # 永続化セッションを復元
+            saved = self.load_sessions()
+            if channel_id in saved:
+                self._restore_sessions(project, saved[channel_id])
+            self.projects[channel_id] = project
         return self.projects[channel_id]
 
     def get_project(self, channel_id: str) -> Optional[Project]:
@@ -1986,6 +1996,84 @@ class ClaudeCodeRunner:
         except Exception as e:
             logger.warning("Failed to load channel roots: %s", e)
             return {}
+
+    def save_sessions(self):
+        """セッション情報を永続化"""
+        now = datetime.now()
+        cutoff = now - timedelta(days=SESSIONS_MAX_AGE_DAYS)
+        data: dict[str, dict[str, dict]] = {}
+        for channel_id, project in self.projects.items():
+            channel_sessions: dict[str, dict] = {}
+            for thread_ts, session in project.sessions.items():
+                if not session.claude_session_id:
+                    continue
+                created = session.created_at or now
+                if created < cutoff:
+                    continue
+                channel_sessions[thread_ts] = {
+                    "thread_ts": session.thread_ts,
+                    "channel_id": session.channel_id,
+                    "claude_session_id": session.claude_session_id,
+                    "label_emoji": session.label_emoji,
+                    "label_name": session.label_name,
+                    "working_dir": session.working_dir,
+                    "created_at": created.isoformat(),
+                }
+            # チャンネルあたり上限を適用（古い順に削除）
+            if len(channel_sessions) > SESSIONS_MAX_PER_CHANNEL:
+                sorted_items = sorted(
+                    channel_sessions.items(),
+                    key=lambda x: x[1].get("created_at", ""),
+                )
+                channel_sessions = dict(sorted_items[-SESSIONS_MAX_PER_CHANNEL:])
+            if channel_sessions:
+                data[channel_id] = channel_sessions
+        try:
+            with open(SESSIONS_FILE, "w") as f:
+                json.dump(data, f, ensure_ascii=False, indent=2)
+        except Exception as e:
+            logger.warning("Failed to save sessions: %s", e)
+
+    def load_sessions(self) -> dict[str, dict[str, dict]]:
+        """永続化セッション情報を読み込み"""
+        try:
+            with open(SESSIONS_FILE, "r") as f:
+                return json.load(f)
+        except (FileNotFoundError, json.JSONDecodeError):
+            return {}
+        except Exception as e:
+            logger.warning("Failed to load sessions: %s", e)
+            return {}
+
+    def _restore_sessions(self, project: Project, channel_data: dict[str, dict]):
+        """永続化データからSessionオブジェクトをProjectに復元"""
+        now = datetime.now()
+        cutoff = now - timedelta(days=SESSIONS_MAX_AGE_DAYS)
+        for thread_ts, sdata in channel_data.items():
+            # 既にメモリにあるセッションは上書きしない
+            if thread_ts in project.sessions:
+                continue
+            # 古いセッションは復元スキップ
+            created_at_str = sdata.get("created_at")
+            if created_at_str:
+                try:
+                    created_at = datetime.fromisoformat(created_at_str)
+                except (ValueError, TypeError):
+                    created_at = now
+                if created_at < cutoff:
+                    continue
+            else:
+                created_at = now
+            session = Session(
+                thread_ts=thread_ts,
+                channel_id=sdata.get("channel_id", project.channel_id),
+                claude_session_id=sdata.get("claude_session_id"),
+                label_emoji=sdata.get("label_emoji", ""),
+                label_name=sdata.get("label_name", ""),
+                working_dir=sdata.get("working_dir"),
+                created_at=created_at,
+            )
+            project.sessions[thread_ts] = session
 
     def get_channel_root(self, channel_id: str) -> Optional[str]:
         """チャンネルのルートディレクトリを取得"""
@@ -2200,6 +2288,7 @@ class ClaudeCodeRunner:
                     if session.claude_session_id:
                         logger.debug("_execute: fallback session_id acquired sid=%s thread=%s",
                                      session.claude_session_id[:16], thread_ts)
+                        self.save_sessions()
                     else:
                         logger.warning("_execute: fallback also failed to get session_id jsonl=%s thread=%s", fallback_path, thread_ts)
                 else:
@@ -3272,6 +3361,7 @@ def _execute_fork(inst: dict, channel_id: str, say, thread_ts, user_id: str,
     session = project.get_or_create_session(thread_ts)
     session.working_dir = cwd
     session.claude_session_id = session_id
+    runner.save_sessions()
     runner.record_directory(channel_id, cwd)
 
     # 4. フォーク完了通知
@@ -3477,6 +3567,9 @@ def main():
     runner.load_directory_history()
     channel_roots = runner.load_channel_roots()
     logger.info("  Channel Roots:    %d", len(channel_roots))
+    saved_sessions = runner.load_sessions()
+    total_sessions = sum(len(v) for v in saved_sessions.values())
+    logger.info("  Saved Sessions:   %d", total_sessions)
 
     # 起動通知
     if NOTIFICATION_CHANNEL:
