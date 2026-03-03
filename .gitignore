@@ -9,12 +9,6 @@ venv/
 # Claude Code
 .claude/
 
-# Instance state
-.instance_state.json
-
-# Channel project bindings
-channel_projects.json
-
 # Directory history
 directory_history.json
 

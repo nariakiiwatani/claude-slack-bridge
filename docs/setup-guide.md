@@ -86,9 +86,17 @@ DEFAULT_ALLOWED_TOOLS=Read,Write,Edit,MultiEdit,Bash(git *),TodoWrite
 
 ## 7. Start the Bridge
 
+Use `scripts/install.sh` to set up and start as a macOS LaunchAgent:
+
 ```bash
-source venv/bin/activate
-python bridge.py
+./scripts/install.sh
+```
+
+To restart:
+
+```bash
+launchctl bootout gui/$(id -u)/com.user.claude-slack-bridge
+launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.user.claude-slack-bridge.plist
 ```
 
 If `NOTIFICATION_CHANNEL` is set, you'll see a startup notification:
@@ -193,9 +201,17 @@ DEFAULT_ALLOWED_TOOLS=Read,Write,Edit,MultiEdit,Bash(git *),TodoWrite
 
 ### 7. Bridge を起動
 
+`scripts/install.sh` でLaunchAgentとしてセットアップ・起動します:
+
 ```bash
-source venv/bin/activate
-python bridge.py
+./scripts/install.sh
+```
+
+再起動:
+
+```bash
+launchctl bootout gui/$(id -u)/com.user.claude-slack-bridge
+launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.user.claude-slack-bridge.plist
 ```
 
 `NOTIFICATION_CHANNEL` を設定している場合、起動通知が届きます:

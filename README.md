@@ -104,14 +104,32 @@ SLACK_ALLOWED_CHANNELS=C3333333333             # Specific channels only ("*" to 
 
 # Auto-approved tools (adjust for your project)
 DEFAULT_ALLOWED_TOOLS=Read,Write,Edit,MultiEdit,Bash(git *),TodoWrite
+
+# Claude command path (optional, default: claude)
+# CLAUDE_CMD=claude
+
+# Log level (optional, default: INFO)
+# LOG_LEVEL=INFO
+
+# Language setting (ja / en, default: ja)
+# SLACK_LANGUAGE=ja
 ```
 
 **How to find your user ID:** Open your Slack profile → "..." → "Copy member ID"
 
 ### 4. Run
 
+Use `scripts/install.sh` for initial setup as a macOS LaunchAgent:
+
 ```bash
-python bridge.py
+./scripts/install.sh
+```
+
+To restart:
+
+```bash
+launchctl bootout gui/$(id -u)/com.user.claude-slack-bridge
+launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.user.claude-slack-bridge.plist
 ```
 
 If `NOTIFICATION_CHANNEL` is configured, you'll receive a startup notification in that channel:
@@ -132,6 +150,8 @@ Invite the bot to a channel and send commands with `@bot` mention. Thread replie
 | (thread reply) `<instruction>` | Auto-resume with `--resume` (no `@bot` mention needed) |
 | `@bot fork <PID> [<task>]` | Fork a running claude CLI process |
 | `@bot fork` | List forkable claude CLI processes |
+| `@bot bind <PID>` | Live-connect to a running terminal Claude CLI process |
+| `@bot bind` | List bindable processes |
 | `@bot status` | Show task status in project |
 | `@bot sessions` | List sessions in project |
 | `@bot cancel #2` | Cancel a task |
@@ -280,37 +300,26 @@ Check the result of npm run build and fix the errors
 
 ## Auto-start (macOS)
 
-To start the bridge automatically when your Mac boots, use a LaunchAgent:
+To start the bridge automatically when your Mac boots, use `scripts/install.sh` which sets up a LaunchAgent (`com.user.claude-slack-bridge`):
 
 ```bash
-cat << 'EOF' > ~/Library/LaunchAgents/com.claude-slack-bridge.plist
-<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
-  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-    <key>Label</key>
-    <string>com.claude-slack-bridge</string>
-    <key>ProgramArguments</key>
-    <array>
-        <string>/path/to/venv/bin/python</string>
-        <string>/path/to/claude-slack-bridge/bridge.py</string>
-    </array>
-    <key>WorkingDirectory</key>
-    <string>/path/to/claude-slack-bridge</string>
-    <key>RunAtLoad</key>
-    <true/>
-    <key>KeepAlive</key>
-    <true/>
-    <key>StandardOutPath</key>
-    <string>/tmp/claude-slack-bridge.log</string>
-    <key>StandardErrorPath</key>
-    <string>/tmp/claude-slack-bridge.err</string>
-</dict>
-</plist>
-EOF
+./scripts/install.sh
+```
 
-launchctl load ~/Library/LaunchAgents/com.claude-slack-bridge.plist
+To manage the service:
+
+```bash
+# Stop
+launchctl bootout gui/$(id -u)/com.user.claude-slack-bridge
+
+# Start
+launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.user.claude-slack-bridge.plist
+
+# Status
+launchctl print gui/$(id -u)/com.user.claude-slack-bridge
+
+# Logs
+tail -f ~/Library/Logs/claude-slack-bridge/stderr.log
 ```
 
 ---
@@ -410,14 +419,32 @@ SLACK_ALLOWED_CHANNELS=C3333333333             # 特定チャンネルのみ（"
 
 # 自動承認ツール（プロジェクトに合わせて調整）
 DEFAULT_ALLOWED_TOOLS=Read,Write,Edit,MultiEdit,Bash(git *),TodoWrite
+
+# claude コマンドのパス（任意、デフォルト: claude）
+# CLAUDE_CMD=claude
+
+# ログレベル（任意、デフォルト: INFO）
+# LOG_LEVEL=INFO
+
+# 言語設定（ja / en、デフォルト: ja）
+# SLACK_LANGUAGE=ja
 ```
 
 **ユーザーIDの確認方法:** Slackで自分のプロフィールを開く → 「...」→ 「メンバーIDをコピー」
 
 #### 4. 起動
 
+`scripts/install.sh` でLaunchAgentとしてセットアップします:
+
 ```bash
-python bridge.py
+./scripts/install.sh
+```
+
+再起動:
+
+```bash
+launchctl bootout gui/$(id -u)/com.user.claude-slack-bridge
+launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.user.claude-slack-bridge.plist
 ```
 
 `NOTIFICATION_CHANNEL` を設定している場合、そのチャンネルに起動通知が届きます:
@@ -438,6 +465,8 @@ botをチャンネルに招待し、`@bot` メンション付きでコマンド�
 | (スレッド返信) `<指示>` | 同セッションで `--resume` 自動続行（`@bot` メンション不要） |
 | `@bot fork <PID> [<タスク>]` | 実行中のclaude CLIプロセスをフォーク |
 | `@bot fork` | フォーク可能なプロセス一覧 |
+| `@bot bind <PID>` | 実行中のターミナルClaude CLIプロセスにライブ接続 |
+| `@bot bind` | バインド可能なプロセス一覧 |
 | `@bot status` | タスクの状態一覧 |
 | `@bot sessions` | セッション一覧 |
 | `@bot cancel #2` | タスクをキャンセル |
@@ -587,37 +616,26 @@ npm run build の結果を見てエラーを修正して
 
 ### 自動起動 (macOS)
 
-Mac起動時に自動で立ち上げたい場合、LaunchAgent を使えます:
+Mac起動時に自動で立ち上げたい場合、`scripts/install.sh` でLaunchAgent（`com.user.claude-slack-bridge`）をセットアップできます:
 
 ```bash
-cat << 'EOF' > ~/Library/LaunchAgents/com.claude-slack-bridge.plist
-<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
-  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-    <key>Label</key>
-    <string>com.claude-slack-bridge</string>
-    <key>ProgramArguments</key>
-    <array>
-        <string>/path/to/venv/bin/python</string>
-        <string>/path/to/claude-slack-bridge/bridge.py</string>
-    </array>
-    <key>WorkingDirectory</key>
-    <string>/path/to/claude-slack-bridge</string>
-    <key>RunAtLoad</key>
-    <true/>
-    <key>KeepAlive</key>
-    <true/>
-    <key>StandardOutPath</key>
-    <string>/tmp/claude-slack-bridge.log</string>
-    <key>StandardErrorPath</key>
-    <string>/tmp/claude-slack-bridge.err</string>
-</dict>
-</plist>
-EOF
+./scripts/install.sh
+```
 
-launchctl load ~/Library/LaunchAgents/com.claude-slack-bridge.plist
+サービスの管理:
+
+```bash
+# 停止
+launchctl bootout gui/$(id -u)/com.user.claude-slack-bridge
+
+# 起動
+launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.user.claude-slack-bridge.plist
+
+# 状態確認
+launchctl print gui/$(id -u)/com.user.claude-slack-bridge
+
+# ログ確認
+tail -f ~/Library/Logs/claude-slack-bridge/stderr.log
 ```
 
 ## ライセンス / License

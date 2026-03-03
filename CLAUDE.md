@@ -36,11 +36,11 @@ tail -f ~/Library/Logs/claude-slack-bridge/stderr.log
 
 Do NOT start bridge.py directly with `python bridge.py` — always use launchctl.
 
-Configuration is in `.env` (copy from `.env.example`). Required: `SLACK_BOT_TOKEN`, `SLACK_APP_TOKEN`, `ADMIN_SLACK_USER_ID`. Optional: `SLACK_ALLOWED_USERS`, `SLACK_ALLOWED_CHANNELS`, `NOTIFICATION_CHANNEL`, `CLAUDE_CMD`, `DEFAULT_ALLOWED_TOOLS`, `LOG_LEVEL`.
+Configuration is in `.env` (copy from `.env.example`). Required: `SLACK_BOT_TOKEN`, `SLACK_APP_TOKEN`, `ADMIN_SLACK_USER_ID`. Optional: `SLACK_ALLOWED_USERS`, `SLACK_ALLOWED_CHANNELS`, `NOTIFICATION_CHANNEL`, `CLAUDE_CMD`, `DEFAULT_ALLOWED_TOOLS`, `LOG_LEVEL`, `SLACK_LANGUAGE`.
 
 ## Architecture
 
-Everything is in a single file: `bridge.py`. Tests are in `tests/`.
+Main logic is in `bridge.py`. Internationalization is in `i18n.py` (bilingual ja/en message table, controlled by `SLACK_LANGUAGE` env var). Tests are in `tests/`.
 
 ### Data Model (3-Layer Hierarchy)
 
@@ -56,15 +56,17 @@ Everything is in a single file: `bridge.py`. Tests are in `tests/`.
 
 - **Access control** — `_is_user_allowed()` and `_is_channel_allowed()` check whitelists. `ADMIN_SLACK_USER_ID` is always allowed. `*` means allow all.
 
-- **Slack event handler** — `handle_message` is the main event handler. Routes channel events (whitelisted, mention required for top-level). Thread reply routing: (1) `instance_threads` with active PTY → mention=command, otherwise forward to CLI, (1.5) `pending_directory_requests` → directory selection, (2) session exists → mention=command (`cancel`/`status`/`tools`), otherwise auto-resume via new task, (3) fallback to command (mention required). `_dispatch_command` is the command parser. `handle_mention` (`app_mention` event) is a no-op to avoid duplicate processing.
+- **Slack event handler** — `handle_message` is the main event handler. Routes channel events (whitelisted, mention required for top-level). Thread reply routing: (1) `instance_threads` registered → mention=command (`cancel`/`status`/`tools`), otherwise forward to CLI stdin, (1.5) `pending_directory_requests` / `pending_fork_selections` / `pending_bind_selections` → selection handling, (2) session exists → mention=command, otherwise auto-resume via new task, (3) fallback to command (mention required). `_dispatch_command` is the command parser. `handle_mention` (`app_mention` event) is a no-op to avoid duplicate processing.
 
 - **Notifications** — `NOTIFICATION_CHANNEL` (optional) receives startup/shutdown notifications. If unset, these are logged only.
 
 - **fork** — `detect_running_claude_instances()` finds existing `claude` CLI processes on the Mac. `fork <PID>` integrates a running process into the Project+Session model with I/O forwarding while alive and `--resume` continuation after death.
 
-- **bind** — Live bidirectional connection to a terminal Claude CLI process. `bind <PID>` creates a Slack thread that mirrors the terminal session. Output is monitored via JSONL (or terminal output fallback). Slack thread replies are forwarded to the terminal via AppleScript clipboard+paste. When the bound process dies, the session transitions to `--resume` mode. Selection state is stored in `pending_bind_selections`.
+- **bind** — Live bidirectional connection to a terminal Claude CLI process. `bind <PID>` creates a Slack thread that mirrors the terminal session. Output is monitored via JSONL. Slack thread replies are forwarded to the terminal via AppleScript clipboard+paste. When the bound process dies, the session transitions to `--resume` mode. Selection state is stored in `pending_bind_selections`.
 
-- **External takeover** — When a bridge-spawned task is running and an external `claude --resume` process is detected with the same `session_id`, the bridge kills its subprocess, switches the `inst` to the external process, and continues monitoring. Detected periodically (every ~15s) inside `_monitor_session_jsonl`. Note: Slack thread displays a truncated session ID (first 12 chars) for reference only — to resume from terminal, use `claude --resume` without args to open the interactive session picker.
+- **root** — `root <path>` sets a channel's default working directory (persisted in `channel_roots.json`). When set, bare tasks (`@bot <task>`) run immediately in that directory without the selection UI. `root` shows the current setting, `root clear` removes it. Handled by `_handle_root`.
+
+- **External takeover** — When a bridge-spawned task is running and an external `claude --resume` process is detected with the same `session_id`, the bridge kills its subprocess, switches the `inst` to the external process, and continues monitoring. Active task takeover is checked every ~15s inside `_monitor_session_jsonl` (via `_TAKEOVER_CHECK_INTERVAL`). Idle session takeover (for sessions with no active task) is detected by a separate thread `_idle_takeover_monitor_loop` (via `_IDLE_TAKEOVER_INTERVAL`). Note: Slack thread displays a truncated session ID (first 12 chars) for reference only — to resume from terminal, use `claude --resume` without args to open the interactive session picker.
 
 - **Bare task** — When `@bot <task>` is sent without `in` or `fork`, `_handle_bare_task` shows fork candidates and directory history for selection. Selection state is stored in `pending_directory_requests`.
 
@@ -72,7 +74,7 @@ Everything is in a single file: `bridge.py`. Tests are in `tests/`.
 
 1. Message event arrives via Socket Mode → `handle_message` routes by `channel_type`
 2. Channel/user whitelist check → mention detection / thread reply routing → command parsing
-3. `_dispatch_command` parses the command. `in` → `_handle_in_dir` → `_start_task_in_dir`. `fork` → `_handle_fork` / `_handle_fork_list`. `bind` → `_handle_bind` / `_handle_bind_list` → `_execute_bind`. Bare task → `_handle_bare_task` → directory selection → `_start_task_in_dir` or `_execute_fork`.
+3. `_dispatch_command` parses the command. `in` → `_handle_in_dir` → `_start_task_in_dir`. `fork` → `_handle_fork` / `_handle_fork_list`. `bind` → `_handle_bind` / `_handle_bind_list` → `_execute_bind`. `root` → `_handle_root` (persists to `channel_roots.json`). Bare task → `_handle_bare_task` → directory selection → `_start_task_in_dir` or `_execute_fork`.
 4. Thread spawns `claude -p --verbose` subprocess with PTY, pipes prompt via stdin. Thread replies to existing sessions automatically use `--resume <session.claude_session_id>`
 5. JSONL output file is monitored for progress (including subagent JSONL files under `subagents/`); session's `claude_session_id` is updated from JSONL entries
 6. On completion/failure, posts final result to Slack thread
@@ -84,7 +86,8 @@ Thread replies to a session's Slack thread automatically create new tasks with `
 ### Persistence
 
 - `directory_history.json` — Per-channel directory usage history (channel_id → [dir_path, ...]). Max 10 entries per channel.
-- `sessions.json` — Per-channel session data (claude_session_id, working_dir, label, etc.). Restored on bridge restart for `--resume` continuity. Unloaded channels' data is preserved across saves. Expired sessions (>30 days) are pruned.
+- `sessions.json` — Per-channel session data (claude_session_id, working_dir, label, etc.). Restored on bridge restart for `--resume` continuity. Unloaded channels' data is preserved across saves. Expired sessions (>7 days) are pruned. Max 50 sessions per channel.
+- `channel_roots.json` — Per-channel root directory settings (channel_id → path). Used by `root` command. Bare tasks in channels with a root set run immediately in that directory.
 - Tasks are volatile (in-memory only, lost on bridge restart).
 
 ## Language
