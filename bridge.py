@@ -801,6 +801,20 @@ def _find_session_jsonl(cwd: str, min_mtime: float = 0, min_ctime: float = 0, ex
     return best_path
 
 
+def _find_jsonl_path_for_session_id(session_id: str) -> Optional[str]:
+    """session_idからJSONLファイルパスを直接特定。~/.claude/projects/*/<session_id>.jsonl を検索。"""
+    projects_base = Path.home() / ".claude" / "projects"
+    if not projects_base.is_dir():
+        return None
+    for proj_dir in projects_base.iterdir():
+        if not proj_dir.is_dir():
+            continue
+        jsonl = proj_dir / f"{session_id}.jsonl"
+        if jsonl.exists():
+            return str(jsonl)
+    return None
+
+
 def _classify_jsonl_entry(entry: dict) -> list[tuple[str, str, dict | None]]:
     """JSONLエントリを (category, text, metadata) のリストに分類。
     category: "status" (thinking/tool_use), "text" (応答テキスト),
@@ -3725,16 +3739,18 @@ def _detect_external_takeover(inst: dict, session: "Session") -> Optional[dict]:
                         continue  # 別セッションの --resume → テイクオーバーではない
                 else:
                     # --resume 引数なし（対話的ピッカー使用）の場合:
-                    # lsof で外部プロセスが bridge の JSONL を開いているか確認。
-                    # detect_running_claude_instances() で claude プロセスに限定済み。
+                    # lsof で外部プロセスが bridge の JSONL またはセッション関連ファイルを
+                    # 開いているか確認。claude CLIはJSONLを常時オープンしないため、
+                    # セッションIDを含む任意のファイルパスもチェックする。
                     try:
                         lsof_result = subprocess.run(
                             ["lsof", "-p", str(ext_inst["pid"]), "-F", "n"],
                             capture_output=True, text=True, timeout=5,
                         )
-                        if not any(line.startswith(f"n{bridge_jsonl}")
-                                   for line in lsof_result.stdout.splitlines()):
-                            continue  # bridge の JSONL を開いていない → 別セッション
+                        lsof_lines = [line[1:] for line in lsof_result.stdout.splitlines()
+                                       if line.startswith("n")]
+                        if not any(bridge_jsonl == f or session_id in f for f in lsof_lines):
+                            continue  # セッション関連ファイルを開いていない → 別セッション
                     except Exception:
                         continue
             except Exception:
@@ -3831,6 +3847,7 @@ def _handle_external_takeover(inst: dict, external: dict, session: "Session",
 # ── アイドルセッション外部テイクオーバー検出 ──────────────────
 
 _IDLE_TAKEOVER_INTERVAL = 15  # 秒（アクティブタスクの検出間隔と同程度）
+_idle_session_jsonl_sizes: dict[str, tuple[str, int]] = {}  # session_id -> (jsonl_path, file_size)
 
 
 def _check_idle_session_takeovers():
@@ -3856,14 +3873,42 @@ def _check_idle_session_takeovers():
                 known_sessions[sid] = (session, project)
 
     if not known_sessions:
+        # known_sessions が空でもクリーンアップは必要
+        for sid in list(_idle_session_jsonl_sizes):
+            _idle_session_jsonl_sizes.pop(sid, None)
         return
 
-    # 2. 外部claudeプロセスを取得
+    # 2. JONLサイズ成長チェック（対話ピッカー検出用）
+    grown_sessions: dict[str, tuple["Session", "Project", str]] = {}  # sid -> (session, project, jsonl_path)
+    for sid, (session, project) in known_sessions.items():
+        prev = _idle_session_jsonl_sizes.get(sid)
+        if prev is not None:
+            jsonl_path, prev_size = prev
+            try:
+                current_size = os.path.getsize(jsonl_path)
+                if current_size > prev_size:
+                    grown_sessions[sid] = (session, project, jsonl_path)
+                _idle_session_jsonl_sizes[sid] = (jsonl_path, current_size)
+            except OSError:
+                _idle_session_jsonl_sizes.pop(sid, None)
+        else:
+            jsonl_path = _find_jsonl_path_for_session_id(sid)
+            if jsonl_path:
+                try:
+                    _idle_session_jsonl_sizes[sid] = (jsonl_path, os.path.getsize(jsonl_path))
+                except OSError:
+                    pass
+    # 不要エントリをクリーンアップ
+    for sid in list(_idle_session_jsonl_sizes):
+        if sid not in known_sessions:
+            del _idle_session_jsonl_sizes[sid]
+
+    # 3. 外部claudeプロセスを取得（成長チェック結果がなくてもlsofフォールバックのために続行）
     instances = detect_running_claude_instances()
     if not instances:
         return
 
-    # 3. フィルタ: bridge子孫 / instance_threadsのアクティブPID を除外
+    # 4. フィルタ: bridge子孫 / instance_threadsのアクティブPID を除外
     active_pids = {inst.get("pid") for inst in instance_threads.values() if inst.get("pid")}
     candidates = []
     for ext in instances:
@@ -3876,7 +3921,7 @@ def _check_idle_session_takeovers():
     if not candidates:
         return
 
-    # 4. 各候補の --resume 引数をチェック
+    # 5. 各候補の --resume 引数をチェック
     for ext in candidates:
         try:
             result = subprocess.run(
@@ -3909,40 +3954,48 @@ def _check_idle_session_takeovers():
                         break
             else:
                 # --resume 引数なし（対話的ピッカー使用）:
-                # lsof で外部プロセスが開いている .jsonl を探し、session_id をマッチ
-                try:
-                    lsof_result = subprocess.run(
-                        ["lsof", "-p", str(ext["pid"]), "-F", "n"],
-                        capture_output=True, text=True, timeout=5,
-                    )
-                    jsonl_sid = None
-                    for line in lsof_result.stdout.splitlines():
-                        if line.startswith("n") and line.endswith(".jsonl"):
-                            jsonl_file = line[1:]  # 'n' プレフィックスを除去
-                            try:
-                                with open(jsonl_file, "r", encoding="utf-8") as f:
-                                    for i, jline in enumerate(f):
-                                        if i >= 10:
+                # 方法1: JONLファイルサイズ成長チェック（ステップ2で検出済み）
+                for sid, (sess, proj, jp) in list(grown_sessions.items()):
+                    matched_session = sess
+                    matched_project = proj
+                    ext["_jsonl_path"] = jp
+                    grown_sessions.pop(sid)  # 消費済み
+                    break
+                # 方法2: lsof フォールバック（JONLが偶然開いていれば検出可能）
+                if not matched_session:
+                    try:
+                        lsof_result = subprocess.run(
+                            ["lsof", "-p", str(ext["pid"]), "-F", "n"],
+                            capture_output=True, text=True, timeout=5,
+                        )
+                        jsonl_sid = None
+                        for line in lsof_result.stdout.splitlines():
+                            if line.startswith("n") and line.endswith(".jsonl"):
+                                jsonl_file = line[1:]
+                                try:
+                                    with open(jsonl_file, "r", encoding="utf-8") as f:
+                                        for i, jline in enumerate(f):
+                                            if i >= 10:
+                                                break
+                                            jline = jline.strip()
+                                            if not jline:
+                                                continue
+                                            try:
+                                                entry = json.loads(jline)
+                                            except json.JSONDecodeError:
+                                                continue
+                                            msg = entry.get("message", {})
+                                            sid = (msg.get("sessionId") if isinstance(msg, dict) else None) or entry.get("sessionId")
+                                            if sid and sid in known_sessions:
+                                                jsonl_sid = sid
+                                                ext["_jsonl_path"] = jsonl_file
+                                                break
+                                        if jsonl_sid:
                                             break
-                                        jline = jline.strip()
-                                        if not jline:
-                                            continue
-                                        try:
-                                            entry = json.loads(jline)
-                                        except json.JSONDecodeError:
-                                            continue
-                                        msg = entry.get("message", {})
-                                        sid = (msg.get("sessionId") if isinstance(msg, dict) else None) or entry.get("sessionId")
-                                        if sid and sid in known_sessions:
-                                            jsonl_sid = sid
-                                            ext["_jsonl_path"] = jsonl_file
-                                            break
-                                    if jsonl_sid:
-                                        break
-                            except OSError:
-                                continue
-                    if jsonl_sid:
-                        matched_session, matched_project = known_sessions[jsonl_sid]
+                                except OSError:
+                                    continue
+                        if jsonl_sid:
+                            matched_session, matched_project = known_sessions[jsonl_sid]
                 except Exception:
                     continue
 
