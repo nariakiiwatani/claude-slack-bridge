@@ -1189,42 +1189,55 @@ def _monitor_session_jsonl(inst: dict, thread_ts: str, channel: str, client: Web
             _flush_progress(final=True)
 
     def _update_text(text: str):
-        """応答テキストを新規メッセージとして投稿。同一テキストの重複投稿を防止。"""
-        nonlocal last_posted_text, latest_text, status_msg_ts, status_lines
+        """応答テキストを進捗メッセージに統合表示。同一テキストの重複更新を防止。"""
+        nonlocal last_posted_text, latest_text
         if text == last_posted_text:
-            return  # 同一テキストの重複投稿を防止
+            return  # 同一テキストの重複更新を防止
         last_posted_text = text
-        latest_text = None  # 進捗メッセージには含めない
+        latest_text = text  # 進捗メッセージ内に表示
         # テキスト応答も履歴に追加（完了時スニペットに含めるため）
         all_status_history.append(f"💬\n{text}")
-        # 進捗メッセージを確定（ステータス行のみ残す）
-        if status_msg_ts and status_lines:
-            _flush_progress(final=True)
-        # テキスト応答を新規メッセージとして投稿（通知を発生させる）
-        display = _md_to_slack(text)
-        msg_text = f":speech_balloon: {display_prefix}\n{display}"
-        if len(msg_text) > MAX_SLACK_MSG_LENGTH:
-            msg_text = msg_text[:MAX_SLACK_MSG_LENGTH - 10] + "\n..."
-        try:
-            client.chat_postMessage(
-                channel=channel, thread_ts=thread_ts,
-                text=msg_text,
-            )
-        except Exception as e:
-            logger.error("Text response post error PID %d: %s", pid, e)
-        # リセット（次のステータス更新で新しい進捗メッセージを作成）
-        status_msg_ts = None
-        status_lines = []
+        # 進捗メッセージを更新（新規メッセージは投稿しない）
+        _flush_progress()
 
-    def _post_question(text: str, metadata: dict | None):
-        """AskUserQuestion の選択肢をスレッドに投稿し、pending_questionを設定。"""
-        try:
-            client.chat_postMessage(
-                channel=channel, thread_ts=thread_ts,
-                text=text,
-            )
-        except Exception as e:
-            logger.error("JSONL question post error PID %d: %s", pid, e)
+    def _post_question(text: str, metadata: dict | None, extra_files: list[dict] | None = None):
+        """AskUserQuestion の選択肢をスレッドに投稿し、pending_questionを設定。
+        進捗メッセージを削除し、進捗履歴をファイルとして添付。"""
+        nonlocal status_msg_ts
+        # 進捗メッセージを削除
+        if status_msg_ts:
+            try:
+                client.chat_delete(channel=channel, ts=status_msg_ts)
+            except Exception as e:
+                logger.debug("Progress message delete before question (best-effort): %s", e)
+            status_msg_ts = None
+        # 進捗履歴をファイルとして添付
+        file_uploads = list(extra_files or [])
+        if all_status_history:
+            file_uploads.append({
+                "content": "\n".join(all_status_history),
+                "filename": "progress.txt",
+                "title": t("status_history_title"),
+            })
+        posted = False
+        if file_uploads:
+            try:
+                client.files_upload_v2(
+                    channel=channel, thread_ts=thread_ts,
+                    initial_comment=text,
+                    file_uploads=file_uploads,
+                )
+                posted = True
+            except Exception as e:
+                logger.error("Question file upload error PID %d: %s", pid, e)
+        if not posted:
+            try:
+                client.chat_postMessage(
+                    channel=channel, thread_ts=thread_ts,
+                    text=text,
+                )
+            except Exception as e:
+                logger.error("JSONL question post error PID %d: %s", pid, e)
         # pending_question を設定（最初の質問のみ対応）
         if metadata and metadata.get("questions"):
             q = metadata["questions"][0]
@@ -1241,21 +1254,19 @@ def _monitor_session_jsonl(inst: dict, thread_ts: str, channel: str, client: Web
                 session_ref.pending_question = pq
 
     def _post_plan_approval(question_text: str, metadata: dict | None):
-        """プラン承認質問を投稿。plan_contentがあればファイルとしてアップロード。"""
+        """プラン承認質問を投稿。plan_contentがあればファイルとして添付。"""
         plan_content = metadata.get("plan_content", "") if metadata else ""
+        extra_files: list[dict] = []
         if plan_content:
-            try:
-                client.files_upload_v2(
-                    channel=channel, thread_ts=thread_ts,
-                    content=plan_content, filename="plan.md",
-                    title=t("question_plan_approval_required"),
-                )
-            except Exception as e:
-                logger.error("Plan file upload error PID %d: %s", pid, e)
+            extra_files.append({
+                "content": plan_content,
+                "filename": "plan.md",
+                "title": t("question_plan_approval_required"),
+            })
         # プラン承認マーカーをmetadataに追加（_post_question→pending_questionに伝播）
         if metadata and metadata.get("questions"):
             metadata["questions"][0]["is_plan_approval"] = True
-        _post_question(question_text, metadata)
+        _post_question(question_text, metadata, extra_files=extra_files)
 
     # 外部テイクオーバー検出用カウンタ（bridge起動タスクのみ）
     _takeover_poll_count = 0
@@ -1292,12 +1303,11 @@ def _monitor_session_jsonl(inst: dict, thread_ts: str, channel: str, client: Web
                         latest_text = None
                         continue
 
-        # 新しい入力があればステータスをリセット（新しいメッセージ群を開始）
+        # 新しい入力があればステータス行をリセット（同じ進捗メッセージを使い続ける）
         if "input_msg_ts" in inst:
             _finalize_progress()
             inst.pop("input_msg_ts")
             inst.pop("input_msg_text", "")
-            status_msg_ts = None
             status_lines = []
             latest_text = None
 
