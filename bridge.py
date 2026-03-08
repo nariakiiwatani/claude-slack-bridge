@@ -18,8 +18,7 @@ Mac上で動くClaude CodeをSlackから操作するブリッジ。
   root [<path>|clear]       → チャンネルのルートディレクトリ設定/表示/解除
   status                    → タスクの状態一覧
   sessions                  → セッション一覧
-  cancel #id                → タスクをキャンセル
-  cancel all                → 全タスクをキャンセル
+  cancel                    → タスクをキャンセル（スレッド内はそのセッション対象）
   tools <list>              → 次回タスクの許可ツール設定（スレッド内のみ）
   help                      → ヘルプ表示
 
@@ -97,6 +96,9 @@ DIRECTORY_HISTORY_MAX = 10
 SESSIONS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "sessions.json")
 SESSIONS_MAX_AGE_DAYS = 7
 SESSIONS_MAX_PER_CHANNEL = 50
+
+# ツールリクエストマーカー検出用正規表現
+_TOOL_REQUEST_RE = re.compile(r"\[TOOL_REQUEST:([^\]]+)\]")
 
 
 # ---------------------------------------------------------------------------
@@ -527,6 +529,7 @@ class Session:
     tasks: list[Task] = field(default_factory=list)
     next_tools: Optional[str] = None  # tools コマンドで設定、次タスク実行時に消費
     pending_question: Optional[dict] = None  # プロセス終了後の --resume 用質問メタデータ
+    pending_tool_request: Optional[dict] = None  # ツール許可リクエスト {"tools": [...], "user_id": "..."}
 
     @property
     def active_task(self) -> Optional[Task]:
@@ -1920,7 +1923,10 @@ class ClaudeCodeRunner:
         disallowed = task.disallowed_tools if task.disallowed_tools is not None else "AskUserQuestion,ExitPlanMode"
         if disallowed:
             cmd.extend(["--disallowedTools", disallowed])
-        cmd.extend(["--append-system-prompt", t("prompt_system_append")])
+        system_prompt = t("prompt_system_append")
+        if tools:
+            system_prompt += t("prompt_allowed_tools_info", tools=tools)
+        cmd.extend(["--append-system-prompt", system_prompt])
 
         if task.resume_session:
             cmd.extend(["--resume", task.resume_session])
@@ -2348,12 +2354,77 @@ class ClaudeCodeRunner:
                     initial_comment=text,
                     file_uploads=file_uploads,
                 )
+                # ツールリクエストマーカー検出（ファイルアップロード完了後）
+                if task.result and task.status == TaskStatus.COMPLETED:
+                    self._check_tool_request(session, task)
                 return
             except Exception as e:
                 logger.error("Completion file upload error: %s", e)
                 # フォールバック: テキストのみ新規投稿
         # ファイルアップロードなし or 失敗時: 新規メッセージとして投稿（通知を発生させる）
         self._post_to_session(session, text)
+        # ツールリクエストマーカー検出（完了メッセージ投稿後）
+        if task.result and task.status == TaskStatus.COMPLETED:
+            self._check_tool_request(session, task)
+        return
+
+    def _check_tool_request(self, session: Session, task: Task):
+        """タスク結果から [TOOL_REQUEST:...] マーカーを検出し、ボタン付きメッセージを投稿"""
+        matches = _TOOL_REQUEST_RE.findall(task.result or "")
+        if not matches:
+            return
+        requested_tools = list(dict.fromkeys(matches))  # 重複排除、順序保持
+        logger.info("_check_tool_request: detected tool requests=%s thread=%s",
+                     requested_tools, session.thread_ts)
+        session.pending_tool_request = {
+            "tools": requested_tools,
+            "user_id": task.user_id,
+        }
+        tools_display = ", ".join(f"`{t_}`" for t_ in requested_tools)
+        # ボタンのvalueにJSON埋め込み（セッション識別用）
+        value_data = json.dumps({
+            "thread_ts": session.thread_ts,
+            "channel_id": session.channel_id,
+            "tools": requested_tools,
+        })
+        blocks = [
+            {
+                "type": "section",
+                "text": {
+                    "type": "mrkdwn",
+                    "text": t("tool_request_message", tools=tools_display),
+                },
+            },
+            {
+                "type": "actions",
+                "block_id": "tool_request_actions",
+                "elements": [
+                    {
+                        "type": "button",
+                        "text": {"type": "plain_text", "text": t("tool_request_approve")},
+                        "style": "primary",
+                        "action_id": "tool_request_approve",
+                        "value": value_data,
+                    },
+                    {
+                        "type": "button",
+                        "text": {"type": "plain_text", "text": t("tool_request_reject")},
+                        "style": "danger",
+                        "action_id": "tool_request_reject",
+                        "value": value_data,
+                    },
+                ],
+            },
+        ]
+        try:
+            self.client.chat_postMessage(
+                channel=session.channel_id,
+                thread_ts=session.thread_ts,
+                text=t("tool_request_message", tools=tools_display),
+                blocks=blocks,
+            )
+        except Exception as e:
+            logger.error("Tool request button post error: %s", e)
 
     def _cleanup_status_message(self, inst: dict | None, session: Session, task: Task):
         """タスク完了時: 進捗メッセージを削除"""
@@ -2525,8 +2596,8 @@ def handle_message(event, say):
                 stripped = _strip_bot_mention(text)
                 if stripped != text:
                     cmd_lower = stripped.lower()
-                    if cmd_lower.startswith("cancel"):
-                        _handle_cancel(stripped, say, parent_ts, channel_id)
+                    if cmd_lower == "cancel":
+                        _handle_cancel_in_thread(say, parent_ts, channel_id)
                         return
                     if cmd_lower == "status":
                         _handle_status(say, parent_ts, channel_id)
@@ -2581,8 +2652,8 @@ def handle_message(event, say):
                             thread_ts=parent_ts,
                         )
                         return
-                    if cmd_lower.startswith("cancel"):
-                        _handle_cancel(input_text, say, parent_ts, channel_id)
+                    if cmd_lower == "cancel":
+                        _handle_cancel_in_thread(say, parent_ts, channel_id)
                         return
                     if cmd_lower == "status":
                         _handle_status(say, parent_ts, channel_id)
@@ -2751,7 +2822,7 @@ def _dispatch_command(text: str, event: dict, say):
         return
 
     # ── cancel ──
-    if cmd_lower.startswith("cancel"):
+    if cmd_lower == "cancel":
         _handle_cancel(text, say, thread_ts, channel_id)
         return
 
@@ -3093,6 +3164,92 @@ def handle_mention(event, say):
     pass
 
 
+# ── ツール許可ボタンハンドラ ──
+def _handle_tool_request_action(ack, body, approved: bool):
+    """ツール許可リクエストの承認/拒否を処理"""
+    ack()
+    action = body["actions"][0]
+    try:
+        value = json.loads(action["value"])
+    except (json.JSONDecodeError, KeyError):
+        logger.error("Tool request action: invalid value")
+        return
+    thread_ts = value["thread_ts"]
+    channel_id = value["channel_id"]
+    requested_tools = value["tools"]
+    user_id = body.get("user", {}).get("id", "")
+
+    project = runner.get_project(channel_id)
+    session = project.sessions.get(thread_ts) if project else None
+    if not session:
+        logger.warning("Tool request action: session not found thread=%s", thread_ts)
+        return
+
+    # ボタンメッセージを更新（ボタン除去）
+    tools_display = ", ".join(f"`{t_}`" for t_ in requested_tools)
+    if approved:
+        update_text = t("tool_request_approved", tools=tools_display)
+    else:
+        update_text = t("tool_request_rejected")
+    try:
+        slack_client.chat_update(
+            channel=channel_id,
+            ts=body["message"]["ts"],
+            text=update_text,
+            blocks=[],  # ボタンを除去
+        )
+    except Exception as e:
+        logger.error("Tool request button update error: %s", e)
+
+    session.pending_tool_request = None
+
+    if not approved:
+        return
+
+    # 承認: 要求ツールを追加して --resume で再実行
+    if not session.claude_session_id:
+        logger.warning("Tool request approve: no session_id for resume thread=%s", thread_ts)
+        return
+    base_tools = DEFAULT_ALLOWED_TOOLS
+    added = ",".join(requested_tools)
+    combined_tools = f"{base_tools},{added}" if base_tools else added
+    logger.info("Tool request approved: tools=%s combined=%s thread=%s",
+                requested_tools, combined_tools, thread_ts)
+
+    prompt = t("tool_request_approved", tools=tools_display)
+    task = Task(
+        id=0,
+        prompt=prompt,
+        allowed_tools=combined_tools,
+        user_id=user_id,
+    )
+    task.resume_session = session.claude_session_id
+
+    runner.assign_task_id(task)
+    text = runner._build_lifecycle_text(session, task, "lifecycle_received")
+    runner._post_lifecycle_msg(session, task, text)
+
+    err = runner.run_task(project, session, task)
+    if err:
+        logger.warning("Tool request approve: run_task error=%s thread=%s", err, thread_ts)
+        try:
+            slack_client.chat_postMessage(
+                channel=channel_id, thread_ts=thread_ts, text=err,
+            )
+        except Exception as e:
+            logger.error("Tool request error post: %s", e)
+
+
+@app.action("tool_request_approve")
+def handle_tool_approve(ack, body):
+    _handle_tool_request_action(ack, body, approved=True)
+
+
+@app.action("tool_request_reject")
+def handle_tool_reject(ack, body):
+    _handle_tool_request_action(ack, body, approved=False)
+
+
 def _help_text() -> str:
     return t("help_text")
 
@@ -3163,28 +3320,37 @@ def _handle_status(say, thread_ts, channel_id: str):
 
 
 def _handle_cancel(text: str, say, thread_ts, channel_id: str):
-    arg = text[6:].strip().lower()
-
-    if arg == "all":
-        count = runner.cancel_all_in_project(channel_id)
-        say(text=t("task_cancel_count", count=count), thread_ts=thread_ts)
+    """トップレベル cancel — プロジェクト内のアクティブタスクが1つならそれをキャンセル"""
+    task_id = None
+    project = runner.get_project(channel_id)
+    if project:
+        active = project.active_sessions
+        if len(active) == 1 and active[0].active_task:
+            task_id = active[0].active_task.id
+    if task_id is None:
+        say(
+            text=t("error_cancel_no_active"),
+            thread_ts=thread_ts,
+        )
         return
 
-    task_id = parse_task_id(arg)
-    if task_id is None:
-        # プロジェクト内のアクティブタスクが1つだけならそれをキャンセル
-        project = runner.get_project(channel_id)
-        if project:
-            active = project.active_sessions
-            if len(active) == 1 and active[0].active_task:
-                task_id = active[0].active_task.id
-        if task_id is None:
-            say(
-                text=t("error_cancel_specify"),
-                thread_ts=thread_ts,
-            )
-            return
+    if runner.cancel_task(task_id):
+        say(text=t("task_cancel_request_sent", task_id=task_id), thread_ts=thread_ts)
+    else:
+        say(text=t("task_not_running", task_id=task_id), thread_ts=thread_ts)
 
+
+def _handle_cancel_in_thread(say, thread_ts: str, channel_id: str):
+    """スレッド内 cancel — そのスレッドのセッションのアクティブタスクをキャンセル"""
+    project = runner.get_project(channel_id)
+    if not project:
+        say(text=t("error_cancel_no_active"), thread_ts=thread_ts)
+        return
+    session = project.sessions.get(thread_ts)
+    if not session or not session.active_task or session.active_task.status != TaskStatus.RUNNING:
+        say(text=t("error_cancel_no_active"), thread_ts=thread_ts)
+        return
+    task_id = session.active_task.id
     if runner.cancel_task(task_id):
         say(text=t("task_cancel_request_sent", task_id=task_id), thread_ts=thread_ts)
     else:
@@ -3996,8 +4162,8 @@ def _check_idle_session_takeovers():
                                     continue
                         if jsonl_sid:
                             matched_session, matched_project = known_sessions[jsonl_sid]
-                except Exception:
-                    continue
+                    except Exception:
+                        pass
 
             if matched_session and matched_project:
                 _initiate_idle_takeover(ext, matched_session, matched_project)

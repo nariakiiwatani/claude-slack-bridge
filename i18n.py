@@ -19,14 +19,13 @@ MESSAGES: dict[str, dict[str, str]] = {
             "• `@bot <タスク>` → ディレクトリ選択画面から実行\n"
             "*スレッド返信:*\n"
             "• `<指示>` → 同セッションで自動続行（メンション不要）\n"
-            "• `@bot cancel [#id|all]` → タスクをキャンセル\n"
+            "• `@bot cancel` → このスレッドのタスクをキャンセル\n"
             "• `@bot status` → タスクの状態一覧\n"
             "• `@bot tools <tool1,...>` → 次回の許可ツール設定\n"
             "*管理:*\n"
             "• `@bot status` → タスクの状態一覧\n"
             "• `@bot sessions` → セッション一覧\n"
-            "• `@bot cancel #2` → タスクをキャンセル\n"
-            "• `@bot cancel all` → 全タスクをキャンセル\n"
+            "• `@bot cancel` → 実行中のタスクをキャンセル\n"
             "*設定:*\n"
             "• `@bot root <絶対パス>` → チャンネルのルートディレクトリを設定\n"
             "• `@bot root` → 現在のルートディレクトリを表示\n"
@@ -64,13 +63,12 @@ MESSAGES: dict[str, dict[str, str]] = {
         "status_history_title": "ステータス履歴",
         "task_reply_to_continue": "_このスレッドに返信すると自動で続行します_",
         "task_working_dir_not_set": "作業ディレクトリが未設定です",
-        "task_cancel_count": ":stop_sign: {count}件のタスクをキャンセルしました",
         "task_cancel_request_sent": ":stop_sign: タスク #{task_id} のキャンセルリクエストを送信しました",
         "task_not_running": "タスク #{task_id} は実行中ではありません",
         "task_timeout_header": ":warning: PID {pid} _(タイムアウト — 部分的な応答)_",
 
         # ── error ──
-        "error_cancel_specify": ":warning: キャンセルするタスクを指定してください: `cancel #2` or `cancel all`",
+        "error_cancel_no_active": ":warning: 実行中のタスクがありません",
         "error_tools_thread_only": ":warning: `tools` コマンドはスレッド内でのみ有効です。タスクのスレッドに返信してください。",
         "error_continue_deprecated": ":warning: `continue` / `resume` は廃止されました。タスクのスレッドに返信すると自動で続行します。",
         "error_absolute_path_required": ":warning: 絶対パスで指定してください: `{path}`",
@@ -196,6 +194,11 @@ MESSAGES: dict[str, dict[str, str]] = {
 
         # ── tools ──
         "tools_set": ":wrench: このセッションの次のタスクの許可ツール: `{tools}`\n続けてタスクを送信してください",
+        "tool_request_message": ":wrench: 以下のツールの実行許可が必要です:\n{tools}",
+        "tool_request_approve": "許可して再実行",
+        "tool_request_reject": "キャンセル",
+        "tool_request_approved": ":white_check_mark: ツール `{tools}` を許可して再実行します",
+        "tool_request_rejected": ":x: ツール許可リクエストをキャンセルしました",
 
         # ── prompt (Claude向けプロンプト) ──
         "prompt_attached_files": "添付ファイル:",
@@ -213,6 +216,19 @@ MESSAGES: dict[str, dict[str, str]] = {
             "プランモードを終了する場合は、ExitPlanModeツールを使わず、"
             "プラン内容をテキストで出力してください。"
             "ユーザーがプランを承認した後、次のメッセージで実行を開始します。"
+            "ツールの呼び出しが権限不足で失敗・拒否された場合や、"
+            "allowedToolsに含まれないツールが必要な場合は、"
+            "代替案の提示や手動実行の提案をせず、"
+            "応答の末尾に [TOOL_REQUEST:ツール名] の形式でマーカーを必ず出力してください。"
+            "ユーザーが許可すればそのツールを使って自動的に再実行されます。"
+            "例: [TOOL_REQUEST:Bash(npm install)] や [TOOL_REQUEST:WebFetch]。"
+            "複数のツールが必要な場合は複数のマーカーを出力してください。"
+        ),
+        "prompt_allowed_tools_info": (
+            "\n現在あなたに許可されているツール: {tools}。"
+            "これ以外のツールが必要な場合（例: 許可リストにないBashコマンドの実行、"
+            "WebFetchによるダウンロードなど）は、手動実行を提案するのではなく、"
+            "必ず [TOOL_REQUEST:ツール名] マーカーを出力してください。"
         ),
     },
     "en": {
@@ -228,14 +244,13 @@ MESSAGES: dict[str, dict[str, str]] = {
             "• `@bot <task>` → Run from directory selection\n"
             "*Thread replies:*\n"
             "• `<instruction>` → Continue in same session (no mention needed)\n"
-            "• `@bot cancel [#id|all]` → Cancel a task\n"
+            "• `@bot cancel` → Cancel this thread's task\n"
             "• `@bot status` → Show task status\n"
             "• `@bot tools <tool1,...>` → Set allowed tools for next task\n"
             "*Management:*\n"
             "• `@bot status` → Show task status\n"
             "• `@bot sessions` → Show session list\n"
-            "• `@bot cancel #2` → Cancel a task\n"
-            "• `@bot cancel all` → Cancel all tasks\n"
+            "• `@bot cancel` → Cancel a running task\n"
             "*Settings:*\n"
             "• `@bot root <absolute-path>` → Set channel root directory\n"
             "• `@bot root` → Show current root directory\n"
@@ -273,13 +288,12 @@ MESSAGES: dict[str, dict[str, str]] = {
         "status_history_title": "Status history",
         "task_reply_to_continue": "_Reply to this thread to continue automatically_",
         "task_working_dir_not_set": "Working directory not set",
-        "task_cancel_count": ":stop_sign: Cancelled {count} task(s)",
         "task_cancel_request_sent": ":stop_sign: Cancel request sent for task #{task_id}",
         "task_not_running": "Task #{task_id} is not running",
         "task_timeout_header": ":warning: PID {pid} _(timeout — partial response)_",
 
         # ── error ──
-        "error_cancel_specify": ":warning: Please specify a task to cancel: `cancel #2` or `cancel all`",
+        "error_cancel_no_active": ":warning: No running tasks",
         "error_tools_thread_only": ":warning: The `tools` command is only available in threads. Reply in the task's thread.",
         "error_continue_deprecated": ":warning: `continue` / `resume` are deprecated. Reply to the task's thread to continue automatically.",
         "error_absolute_path_required": ":warning: Please use an absolute path: `{path}`",
@@ -405,6 +419,11 @@ MESSAGES: dict[str, dict[str, str]] = {
 
         # ── tools ──
         "tools_set": ":wrench: Allowed tools for next task in this session: `{tools}`\nSend a task to continue",
+        "tool_request_message": ":wrench: The following tools need permission to run:\n{tools}",
+        "tool_request_approve": "Approve & retry",
+        "tool_request_reject": "Cancel",
+        "tool_request_approved": ":white_check_mark: Approved `{tools}` — retrying task",
+        "tool_request_rejected": ":x: Tool permission request cancelled",
 
         # ── prompt (Claude向け — 英語圏でも理解可能) ──
         "prompt_attached_files": "Attached files:",
@@ -421,7 +440,21 @@ MESSAGES: dict[str, dict[str, str]] = {
             "Do not proceed without waiting for the answer. "
             "When exiting plan mode, do not use the ExitPlanMode tool. "
             "Instead, output your plan as text. "
-            "The user will approve the plan, and execution will begin in the next message."
+            "The user will approve the plan, and execution will begin in the next message. "
+            "If a tool call is rejected due to insufficient permissions, "
+            "or you need a tool not in your allowedTools, "
+            "do NOT suggest manual execution or workarounds. "
+            "Instead, ALWAYS output a marker at the end of your response: "
+            "[TOOL_REQUEST:ToolName]. "
+            "The user can approve it and the task will automatically retry with that tool enabled. "
+            "Examples: [TOOL_REQUEST:Bash(npm install)] or [TOOL_REQUEST:WebFetch]. "
+            "Output multiple markers if you need multiple tools."
+        ),
+        "prompt_allowed_tools_info": (
+            "\nYour currently allowed tools: {tools}. "
+            "If you need any tool not in this list (e.g. a Bash command not matching the allowed pattern, "
+            "WebFetch for downloading, etc.), do NOT suggest manual execution. "
+            "Instead, ALWAYS output a [TOOL_REQUEST:ToolName] marker."
         ),
     },
 }
