@@ -18,6 +18,9 @@ sessions.json
 # Channel root directories
 channel_roots.json
 
+# Project approved tools
+project_tools.json
+
 # macOS
 .DS_Store
 

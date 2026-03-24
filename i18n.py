@@ -195,9 +195,13 @@ MESSAGES: dict[str, dict[str, str]] = {
         # ── tools ──
         "tools_set": ":wrench: このセッションの次のタスクの許可ツール: `{tools}`\n続けてタスクを送信してください",
         "tool_request_message": ":wrench: 以下のツールの実行許可が必要です:\n{tools}",
-        "tool_request_approve": "許可して再実行",
+        "tool_request_approve_once": "一回のみ許可",
+        "tool_request_approve_session": "セッション中許可",
+        "tool_request_approve_project": "プロジェクト中許可",
         "tool_request_reject": "キャンセル",
-        "tool_request_approved": ":white_check_mark: ツール `{tools}` を許可して再実行します",
+        "tool_request_approved_once": ":white_check_mark: ツール {tools} を許可して再実行します（一回のみ）",
+        "tool_request_approved_session": ":white_check_mark: ツール {tools} をこのセッション中許可して再実行します",
+        "tool_request_approved_project": ":white_check_mark: ツール {tools} をこのプロジェクト中許可して再実行します",
         "tool_request_rejected": ":x: ツール許可リクエストをキャンセルしました",
 
         # ── prompt (Claude向けプロンプト) ──
@@ -420,9 +424,13 @@ MESSAGES: dict[str, dict[str, str]] = {
         # ── tools ──
         "tools_set": ":wrench: Allowed tools for next task in this session: `{tools}`\nSend a task to continue",
         "tool_request_message": ":wrench: The following tools need permission to run:\n{tools}",
-        "tool_request_approve": "Approve & retry",
+        "tool_request_approve_once": "Allow once",
+        "tool_request_approve_session": "Allow for session",
+        "tool_request_approve_project": "Allow for project",
         "tool_request_reject": "Cancel",
-        "tool_request_approved": ":white_check_mark: Approved `{tools}` — retrying task",
+        "tool_request_approved_once": ":white_check_mark: Approved {tools} — retrying (once only)",
+        "tool_request_approved_session": ":white_check_mark: Approved {tools} for this session — retrying",
+        "tool_request_approved_project": ":white_check_mark: Approved {tools} for this project — retrying",
         "tool_request_rejected": ":x: Tool permission request cancelled",
 
         # ── prompt (Claude向け — 英語圏でも理解可能) ──
