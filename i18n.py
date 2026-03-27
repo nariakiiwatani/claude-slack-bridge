@@ -12,8 +12,8 @@ MESSAGES: dict[str, dict[str, str]] = {
             ":robot_face: *Claude Code Bridge* — 使い方:\n"
             "*基本操作:*\n"
             "• `@bot in <path> <タスク>` → 指定ディレクトリでタスクを実行\n"
-            "• `@bot fork <PID> [<タスク>]` → 実行中のclaude CLIプロセスをフォーク\n"
-            "• `@bot fork` → フォーク可能なプロセス一覧\n"
+            "• `@bot fork [<PID|リンク|ラベル|セッションID>] [<タスク>]` → セッションを分岐\n"
+            "• `@bot fork` → フォーク可能な候補一覧\n"
             "• `@bot bind <PID>` → ターミナルのclaude CLIにライブ接続\n"
             "• `@bot bind` → バインド可能なプロセス一覧\n"
             "• `@bot <タスク>` → ディレクトリ選択画面から実行\n"
@@ -85,7 +85,7 @@ MESSAGES: dict[str, dict[str, str]] = {
         "error_need_working_dir": (
             ":warning: 作業ディレクトリを指定してください\n"
             "• `in <path> <タスク>` — 指定ディレクトリで実行\n"
-            "• `fork <PID>` — 実行中のプロセスをフォーク"
+            "• `fork <PID|ラベル>` — セッションをフォーク"
         ),
         "error_enter_number_path_cancel": ":warning: 番号、絶対パス、または `cancel` を入力してください",
 
@@ -93,8 +93,10 @@ MESSAGES: dict[str, dict[str, str]] = {
         "fork_no_instances": ":mag: 実行中のclaude CLIインスタンスが見つかりません",
         "fork_pid_already_tracked": ":warning: PID {pid} は既に追跡中です",
         "fork_pid_not_found": ":warning: PID {pid} が見つかりません",
-        "fork_no_forkable": ":mag: フォーク可能なclaude CLIインスタンスはありません",
-        "fork_list_header": ":computer: *フォーク可能なclaude CLIインスタンス:*",
+        "fork_no_forkable": ":mag: フォーク可能な候補がありません（外部プロセス・セッションとも）",
+        "fork_list_header": ":fork_and_knife: *フォーク可能な候補:*",
+        "fork_ext_header": "\n:computer: *外部プロセス:*",
+        "fork_session_header": "\n:clipboard: *ブリッジセッション:*",
         "fork_select_or_cancel": "\n番号を入力して選択、または `cancel` でキャンセル",
         "fork_cancelled": ":x: フォーク選択をキャンセルしました",
         "fork_pid_exited": ":warning: PID {pid} は既に終了しています",
@@ -103,10 +105,12 @@ MESSAGES: dict[str, dict[str, str]] = {
             ":file_folder: `{cwd}`\n"
             "JSONLファイルが見つからないか、session_id が含まれていません"
         ),
-        "fork_success": (
-            ":fork_and_knife: PID {pid} の文脈を引き継ぎました\n"
-            ":file_folder: `{cwd}`{sid_info}\n"
-            "_このスレッドに返信すると同じ文脈で新しいタスクを実行します_"
+        "fork_session_not_found": ":warning: `{query}` に一致するフォーク可能なセッションが見つかりません",
+        "fork_session_matches": ":fork_and_knife: `{query}` に一致するセッション:",
+        "fork_session_start": (
+            ":fork_and_knife: セッション *{source}* から分岐しました\n"
+            ":file_folder: `{cwd}`\n"
+            "_元のセッションには影響しません。このスレッドに返信してタスクを開始してください_"
         ),
 
         # ── bind ──
@@ -241,8 +245,8 @@ MESSAGES: dict[str, dict[str, str]] = {
             ":robot_face: *Claude Code Bridge* — Usage:\n"
             "*Basic:*\n"
             "• `@bot in <path> <task>` → Run a task in the specified directory\n"
-            "• `@bot fork <PID> [<task>]` → Fork a running Claude CLI process\n"
-            "• `@bot fork` → List forkable processes\n"
+            "• `@bot fork [<PID|link|label|session-ID>] [<task>]` → Fork a session\n"
+            "• `@bot fork` → List forkable candidates\n"
             "• `@bot bind <PID>` → Live-connect to a terminal Claude CLI\n"
             "• `@bot bind` → List bindable processes\n"
             "• `@bot <task>` → Run from directory selection\n"
@@ -314,7 +318,7 @@ MESSAGES: dict[str, dict[str, str]] = {
         "error_need_working_dir": (
             ":warning: Please specify a working directory\n"
             "• `in <path> <task>` — Run in specified directory\n"
-            "• `fork <PID>` — Fork a running process"
+            "• `fork <PID|label>` — Fork a session"
         ),
         "error_enter_number_path_cancel": ":warning: Please enter a number, absolute path, or `cancel`",
 
@@ -322,8 +326,10 @@ MESSAGES: dict[str, dict[str, str]] = {
         "fork_no_instances": ":mag: No running Claude CLI instances found",
         "fork_pid_already_tracked": ":warning: PID {pid} is already being tracked",
         "fork_pid_not_found": ":warning: PID {pid} not found",
-        "fork_no_forkable": ":mag: No forkable Claude CLI instances available",
-        "fork_list_header": ":computer: *Forkable Claude CLI instances:*",
+        "fork_no_forkable": ":mag: No forkable candidates available (no external processes or sessions)",
+        "fork_list_header": ":fork_and_knife: *Forkable candidates:*",
+        "fork_ext_header": "\n:computer: *External processes:*",
+        "fork_session_header": "\n:clipboard: *Bridge sessions:*",
         "fork_select_or_cancel": "\nEnter a number to select, or `cancel` to abort",
         "fork_cancelled": ":x: Fork selection cancelled",
         "fork_pid_exited": ":warning: PID {pid} has already exited",
@@ -332,10 +338,12 @@ MESSAGES: dict[str, dict[str, str]] = {
             ":file_folder: `{cwd}`\n"
             "JSONL file not found or does not contain session_id"
         ),
-        "fork_success": (
-            ":fork_and_knife: Inherited context from PID {pid}\n"
-            ":file_folder: `{cwd}`{sid_info}\n"
-            "_Reply to this thread to run new tasks in the same context_"
+        "fork_session_not_found": ":warning: No forkable session matching `{query}` found",
+        "fork_session_matches": ":fork_and_knife: Sessions matching `{query}`:",
+        "fork_session_start": (
+            ":fork_and_knife: Forked from session *{source}*\n"
+            ":file_folder: `{cwd}`\n"
+            "_The original session will not be affected. Reply to this thread to start a task_"
         ),
 
         # ── bind ──

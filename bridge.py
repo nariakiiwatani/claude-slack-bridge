@@ -508,6 +508,7 @@ class Task:
 
     # セッション継続（Session.claude_session_id から自動設定）
     resume_session: Optional[str] = None
+    fork_session: bool = False  # True: --fork-session 付きで起動（元セッションに影響を与えない分岐）
 
     # ライフサイクルメッセージ（chat_update で段階的に更新するメッセージのts）
     lifecycle_msg_ts: Optional[str] = None
@@ -532,6 +533,8 @@ class Session:
     approved_tools: set[str] = field(default_factory=set)  # セッション単位で承認済みツール
     pending_question: Optional[dict] = None  # プロセス終了後の --resume 用質問メタデータ
     pending_tool_request: Optional[dict] = None  # ツール許可リクエスト {"tools": [...], "user_id": "..."}
+    pending_fork: bool = False  # True: 次のタスク実行時に --fork-session を付与（1回消費）
+    prompts: list[str] = field(default_factory=list)  # ユーザー指示の履歴（永続化）
 
     @property
     def active_task(self) -> Optional[Task]:
@@ -555,6 +558,13 @@ class Session:
         tools = self.next_tools
         self.next_tools = None
         return tools
+
+    def consume_fork(self) -> bool:
+        """pending_fork を取り出してリセット"""
+        if self.pending_fork:
+            self.pending_fork = False
+            return True
+        return False
 
 
 @dataclass
@@ -1846,6 +1856,7 @@ class ClaudeCodeRunner:
                     "label_name": session.label_name,
                     "working_dir": session.working_dir,
                     "created_at": created.isoformat(),
+                    "prompts": session.prompts,
                 }
             # チャンネルあたり上限を適用（古い順に削除）
             if len(channel_sessions) > SESSIONS_MAX_PER_CHANNEL:
@@ -1887,6 +1898,18 @@ class ClaudeCodeRunner:
             logger.warning("Failed to load sessions: %s", e)
             return {}
 
+    @staticmethod
+    def _migrate_prompts(sdata: dict) -> list[str]:
+        """旧形式 (first_prompt/latest_prompt) から prompts リストへマイグレーション"""
+        prompts = []
+        fp = sdata.get("first_prompt")
+        lp = sdata.get("latest_prompt")
+        if fp:
+            prompts.append(fp)
+        if lp and lp != fp:
+            prompts.append(lp)
+        return prompts
+
     def _restore_sessions(self, project: Project, channel_data: dict[str, dict]):
         """永続化データからSessionオブジェクトをProjectに復元"""
         now = datetime.now()
@@ -1918,6 +1941,7 @@ class ClaudeCodeRunner:
                 label_name=sdata.get("label_name", ""),
                 working_dir=sdata.get("working_dir"),
                 created_at=created_at,
+                prompts=sdata.get("prompts") or self._migrate_prompts(sdata),
             )
             project.sessions[thread_ts] = session
             restored_count += 1
@@ -1980,6 +2004,8 @@ class ClaudeCodeRunner:
 
         if task.resume_session:
             cmd.extend(["--resume", task.resume_session])
+        if task.fork_session:
+            cmd.append("--fork-session")
 
         if prompt_as_arg:
             cmd.append("--")
@@ -1994,6 +2020,10 @@ class ClaudeCodeRunner:
             if task.id == 0:
                 task.id = self._next_id()
             session.tasks.append(task)
+            # プロンプト履歴を更新（永続化用）
+            if task.prompt:
+                session.prompts.append(task.prompt)
+            self.save_sessions()
 
         thread = threading.Thread(
             target=self._execute, args=(project, session, task), daemon=True
@@ -2853,6 +2883,10 @@ def _handle_thread_reply_task(prompt: str, project: Project, session: Session,
     # セッションにclaude_session_idがあれば自動で --resume
     if session.claude_session_id:
         task.resume_session = session.claude_session_id
+        # pending_fork: fork登録後の最初のタスクに --fork-session を付与
+        if session.consume_fork():
+            task.fork_session = True
+            logger.info("_handle_thread_reply_task: fork-session for sid=%s thread=%s", session.claude_session_id[:16], thread_ts)
         logger.info("_handle_thread_reply_task: creating task with --resume sid=%s thread=%s", session.claude_session_id[:16], thread_ts)
     else:
         logger.warning("_handle_thread_reply_task: no session_id, running new task without --resume thread=%s", thread_ts)
@@ -3550,37 +3584,129 @@ def _handle_in_dir(text: str, say, thread_ts, channel_id: str, user_id: str = ""
     _start_task_in_dir(dir_path, prompt, say, thread_ts, channel_id, user_id, files)
 
 
+def _parse_thread_link(text: str) -> tuple[str | None, str | None]:
+    """Slackスレッドリンクからchannel_id, thread_tsを抽出。
+    例: https://app.slack.com/archives/C12345/p1234567890123456"""
+    m = re.search(r"archives/([A-Z0-9]+)/p(\d+)", text)
+    if m:
+        channel = m.group(1)
+        raw_ts = m.group(2)
+        # p1234567890123456 → 1234567890.123456
+        thread_ts = raw_ts[:-6] + "." + raw_ts[-6:]
+        return channel, thread_ts
+    return None, None
+
+
+def _search_forkable_sessions(query: str, channel_id: str) -> list[dict]:
+    """クエリ文字列でブリッジセッションを絞り込み検索。
+    スレッドリンク、ラベル（部分一致）、セッションID（前方一致）に対応。"""
+    # スレッドリンク
+    link_ch, link_ts = _parse_thread_link(query)
+    if link_ch and link_ts:
+        # リンク先のチャンネルのセッションを検索
+        project = runner.get_project(link_ch)
+        if project and link_ts in project.sessions:
+            s = project.sessions[link_ts]
+            if s.claude_session_id and s.working_dir:
+                return [{"session": s, "channel_id": link_ch}]
+        return []
+
+    # ラベル・セッションID 検索（現チャンネルのみ）
+    all_sessions = _collect_forkable_sessions(channel_id)
+    results = []
+    query_lower = query.lower()
+    for item in all_sessions:
+        s = item["session"]
+        # ラベル部分一致
+        if s.label_name and query_lower in s.label_name.lower():
+            results.append(item)
+        # セッションID前方一致
+        elif s.claude_session_id and s.claude_session_id.startswith(query):
+            results.append(item)
+    return results
+
+
 def _handle_fork(rest: str, say, thread_ts, channel_id: str, user_id: str,
                  files: list[dict] | None = None):
-    """fork <PID> [<task>] — 実行中のclaude CLIプロセスをフォーク"""
+    """fork <PID|スレッドリンク|ラベル|セッションID> [<task>] — セッションをフォーク"""
     parts = rest.split(maxsplit=1)
-    pid_str = parts[0]
+    identifier = parts[0]
     initial_input = parts[1] if len(parts) > 1 else None
 
+    # PID指定を試行
     try:
-        target_pid = int(pid_str)
+        target_pid = int(identifier)
+        # 数値 → 外部プロセスfork（従来動作）
+        instances = detect_running_claude_instances()
+        if not instances:
+            say(text=t("fork_no_instances"), thread_ts=thread_ts)
+            return
+
+        tracked_pids = {data["pid"] for data in instance_threads.values()}
+        candidates = [i for i in instances if i["pid"] not in tracked_pids]
+
+        matched = [i for i in candidates if i["pid"] == target_pid]
+        if not matched:
+            if target_pid in tracked_pids:
+                say(text=t("fork_pid_already_tracked", pid=target_pid), thread_ts=thread_ts)
+            else:
+                say(text=t("fork_pid_not_found", pid=target_pid), thread_ts=thread_ts)
+            return
+
+        _execute_fork(matched[0], channel_id, say, thread_ts, user_id, initial_input)
+        return
     except ValueError:
-        say(text=t("error_pid_not_number"), thread_ts=thread_ts)
+        pass
+
+    # スレッドリンク / ラベル / セッションID → ブリッジセッションfork
+    # identifier にスペースを含むラベルの場合を考慮し、restをスレッドリンク検出でも試す
+    link_ch, link_ts = _parse_thread_link(rest)
+    if link_ch:
+        # スレッドリンク + 残りをタスクとして扱う
+        # Slackは <URL> や <URL|label> 形式でリンクを送るので、その全体を除去
+        remainder = re.sub(r"<[^>]*>", "", rest).strip()
+        initial_input = remainder if remainder else None
+        matches = _search_forkable_sessions(rest, channel_id)
+    else:
+        matches = _search_forkable_sessions(identifier, channel_id)
+
+    if not matches:
+        say(text=t("fork_session_not_found", query=identifier), thread_ts=thread_ts)
         return
 
-    # 実行中のclaude CLIプロセスを検出
-    instances = detect_running_claude_instances()
-    if not instances:
-        say(text=t("fork_no_instances"), thread_ts=thread_ts)
+    if len(matches) == 1:
+        # 一意にマッチ → 即実行
+        item = matches[0]
+        s = item["session"]
+        _execute_fork_session(
+            source_session_id=s.claude_session_id,
+            cwd=s.working_dir,
+            channel_id=channel_id,
+            say=say,
+            thread_ts=thread_ts,
+            user_id=user_id,
+            initial_input=initial_input,
+            source_label=s.display_label or s.claude_session_id[:12],
+        )
         return
 
-    tracked_pids = {data["pid"] for data in instance_threads.values()}
-    candidates = [i for i in instances if i["pid"] not in tracked_pids]
+    # 複数マッチ → 選択肢表示
+    options = []
+    lines = [t("fork_session_matches", query=identifier)]
+    for idx, item in enumerate(matches, 1):
+        s = item["session"]
+        desc = _format_session_option(s, item["channel_id"])
+        lines.append(f"  `{idx}` — {desc}")
+        options.append(("session", item))
+    lines.append(t("fork_select_or_cancel"))
+    say(text="\n".join(lines), thread_ts=thread_ts)
 
-    matched = [i for i in candidates if i["pid"] == target_pid]
-    if not matched:
-        if target_pid in tracked_pids:
-            say(text=t("fork_pid_already_tracked", pid=target_pid), thread_ts=thread_ts)
-        else:
-            say(text=t("fork_pid_not_found", pid=target_pid), thread_ts=thread_ts)
-        return
-
-    _execute_fork(matched[0], channel_id, say, thread_ts, user_id, initial_input)
+    pending_fork_selections[channel_id] = {
+        "options": options,
+        "thread_ts": thread_ts,
+        "user_id": user_id,
+        "initial_input": initial_input,
+    }
 
 
 def _handle_sessions(say, thread_ts, channel_id: str):
@@ -3630,36 +3756,147 @@ def _handle_sessions(say, thread_ts, channel_id: str):
     say(text="\n".join(lines), thread_ts=thread_ts)
 
 
+def _collect_forkable_sessions(channel_id: str) -> list[dict]:
+    """ブリッジ管理セッションからフォーク可能なもの（claude_session_id あり）を収集。
+    返す各要素: {"session": Session, "channel_id": str}"""
+    results = []
+    project = runner.get_project(channel_id)
+    if not project:
+        return results
+    for session in project.sessions.values():
+        if session.claude_session_id and session.working_dir:
+            results.append({"session": session, "channel_id": channel_id})
+    # 最新順
+    results.sort(key=lambda x: x["session"].created_at or datetime.min, reverse=True)
+    return results
+
+
+def _format_session_option(session: Session, channel_id: str) -> str:
+    """セッション選択肢の表示文字列を生成。
+    初回と最新のユーザー指示の冒頭を表示して内容がわかるようにする。"""
+    cwd = session.working_dir or ""
+    dir_name = os.path.basename(cwd) if cwd else "N/A"
+    thread_link_url = _slack_thread_link(channel_id, session.thread_ts)
+    thread_link = f"<{thread_link_url}|:speech_balloon:>"
+
+    prompts = session.prompts
+    first = prompts[0] if prompts else None
+    latest = prompts[-1] if len(prompts) >= 2 else None
+
+    def _preview(text: str, max_len: int = 30) -> str:
+        return text[:max_len] + ("..." if len(text) > max_len else "")
+
+    parts = [f":file_folder:`{dir_name}`"]
+    if first:
+        parts.append(f"_{_preview(first)}_")
+    if latest:
+        parts.append(f":arrow_right: _{_preview(latest)}_")
+    parts.append(thread_link)
+    return " ".join(parts)
+
+
 def _handle_fork_list(say, thread_ts, channel_id: str, user_id: str):
-    """fork（引数なし）: フォーク可能なプロセスリスト表示"""
+    """fork（引数なし）: 外部プロセス + ブリッジセッション両方のフォーク候補を表示"""
+    # 外部プロセス
     instances = detect_running_claude_instances()
     tracked_pids = {data["pid"] for data in instance_threads.values()}
-    candidates = [i for i in instances if i["pid"] not in tracked_pids] if instances else []
+    ext_candidates = [i for i in instances if i["pid"] not in tracked_pids] if instances else []
 
-    if not candidates:
+    # ブリッジセッション
+    bridge_sessions = _collect_forkable_sessions(channel_id)
+
+    if not ext_candidates and not bridge_sessions:
         say(text=t("fork_no_forkable"), thread_ts=thread_ts)
         return
 
+    options = []  # (type, data)
     lines = [t("fork_list_header")]
-    for i, inst in enumerate(candidates, 1):
-        lines.append(f"  `{i}` — PID {inst['pid']}  :file_folder: `{inst['cwd']}`  :clock1: {inst['etime']}")
+    idx = 1
+
+    # 外部プロセス
+    if ext_candidates:
+        lines.append(t("fork_ext_header"))
+        for inst in ext_candidates:
+            lines.append(f"  `{idx}` — PID {inst['pid']}  :file_folder: `{inst['cwd']}`  :clock1: {inst['etime']}")
+            options.append(("ext", inst))
+            idx += 1
+
+    # ブリッジセッション
+    if bridge_sessions:
+        lines.append(t("fork_session_header"))
+        for item in bridge_sessions:
+            s = item["session"]
+            desc = _format_session_option(s, item["channel_id"])
+            lines.append(f"  `{idx}` — {desc}")
+            options.append(("session", item))
+            idx += 1
+
     lines.append(t("fork_select_or_cancel"))
     say(text="\n".join(lines), thread_ts=thread_ts)
 
     pending_fork_selections[channel_id] = {
-        "instances": candidates,
+        "options": options,
         "thread_ts": thread_ts,
         "user_id": user_id,
     }
 
 
+def _execute_fork_session(source_session_id: str, cwd: str, channel_id: str,
+                          say, thread_ts: str, user_id: str,
+                          initial_input: str | None = None,
+                          source_label: str = ""):
+    """セッションIDからフォーク実行（共通処理）。
+    initial_input がある場合: 即座に --resume --fork-session でCLIを起動。
+    initial_input がない場合: セッション登録のみ（pending_fork=True）。
+      ユーザーがスレッド返信したときに初めて --fork-session 付きで起動。"""
+
+    # Project / Session 作成
+    project = runner.get_or_create_project(channel_id)
+    session = project.get_or_create_session(thread_ts)
+    session.working_dir = cwd
+    session.claude_session_id = source_session_id
+    runner.save_sessions()
+    runner.record_directory(channel_id, cwd)
+
+    # フォーク通知
+    sid_short = source_session_id[:12] + "..."
+    say(
+        text=t("fork_session_start", source=source_label or sid_short, cwd=cwd),
+        thread_ts=thread_ts,
+    )
+
+    if not initial_input:
+        # タスク指示なし → セッション登録のみ。次のスレッド返信で --fork-session 付き起動
+        session.pending_fork = True
+        runner.save_sessions()
+        return
+
+    # --resume --fork-session でタスク即時起動
+    task = Task(
+        id=0,
+        prompt=initial_input,
+        allowed_tools=session.consume_tools(),
+        user_id=user_id,
+    )
+    task.resume_session = source_session_id
+    task.fork_session = True
+
+    runner.assign_task_id(task)
+    lc_text = runner._build_lifecycle_text(session, task, "lifecycle_received")
+    runner._post_lifecycle_msg(session, task, lc_text)
+
+    err = runner.run_task(project, session, task)
+    if err:
+        say(text=err, thread_ts=thread_ts)
+
+
 def _execute_fork(inst: dict, channel_id: str, say, thread_ts, user_id: str,
                   initial_input: str | None = None):
-    """フォーク実行: Project+Session作成、session_id取得（ワンショットモード）"""
+    """外部プロセスからのフォーク実行: session_id を取得して --fork-session で分岐"""
     pid = inst["pid"]
     cwd = inst["cwd"]
 
-    # 1. JSONL から session_id を抽出（先に確認）
+    # JSONL から session_id を抽出
     jsonl_path = _find_session_jsonl(cwd)
     session_id = None
     if jsonl_path:
@@ -3675,40 +3912,16 @@ def _execute_fork(inst: dict, channel_id: str, say, thread_ts, user_id: str,
         )
         return
 
-    # 2. Project 取得/作成
-    project = runner.get_or_create_project(channel_id)
-
-    # 3. Session 作成 + working_dir / claude_session_id 設定（元メッセージのスレッドを使用）
-    session = project.get_or_create_session(thread_ts)
-    session.working_dir = cwd
-    session.claude_session_id = session_id
-    runner.save_sessions()
-    runner.record_directory(channel_id, cwd)
-
-    # 4. フォーク完了通知
-    sid_info = f"\n_Session: `{session_id[:12]}...`_"
-    say(
-        text=t("fork_success", pid=pid, cwd=cwd, sid_info=sid_info),
+    _execute_fork_session(
+        source_session_id=session_id,
+        cwd=cwd,
+        channel_id=channel_id,
+        say=say,
         thread_ts=thread_ts,
+        user_id=user_id,
+        initial_input=initial_input,
+        source_label=f"PID {pid}",
     )
-
-    # 5. initial_input がある場合、--resume 付きタスクとして実行
-    if initial_input:
-        task = Task(
-            id=0,
-            prompt=initial_input,
-            allowed_tools=session.consume_tools(),
-            user_id=user_id,
-        )
-        task.resume_session = session_id
-        # Stage 1: リクエスト受付を即時投稿
-        runner.assign_task_id(task)
-        lc_text = runner._build_lifecycle_text(session, task, "lifecycle_received")
-        runner._post_lifecycle_msg(session, task, lc_text)
-
-        err = runner.run_task(project, session, task)
-        if err:
-            say(text=err, thread_ts=thread_ts)
 
 
 def _handle_fork_selection(text: str, say, channel_id: str) -> bool:
@@ -3718,9 +3931,10 @@ def _handle_fork_selection(text: str, say, channel_id: str) -> bool:
         return False
 
     selection = pending_fork_selections[channel_id]
-    instances = selection["instances"]
+    options = selection["options"]
     thread_ts = selection["thread_ts"]
     user_id = selection["user_id"]
+    initial_input = selection.get("initial_input")
     input_text = text.strip().lower()
 
     # cancel
@@ -3735,19 +3949,32 @@ def _handle_fork_selection(text: str, say, channel_id: str) -> bool:
     except ValueError:
         return False  # 数字でもcancelでもない → 通常のコマンド処理にfallthrough
 
-    if num < 1 or num > len(instances):
-        say(text=t("error_enter_number_range", max=len(instances)), thread_ts=thread_ts)
+    if num < 1 or num > len(options):
+        say(text=t("error_enter_number_range", max=len(options)), thread_ts=thread_ts)
         return True
 
-    selected = instances[num - 1]
+    opt_type, opt_data = options[num - 1]
     del pending_fork_selections[channel_id]
 
-    # プロセス死亡チェック
-    if not _is_process_alive(selected["pid"]):
-        say(text=t("fork_pid_exited", pid=selected['pid']), thread_ts=thread_ts)
-        return True
-
-    _execute_fork(selected, channel_id, say, thread_ts, user_id)
+    if opt_type == "ext":
+        # 外部プロセス
+        if not _is_process_alive(opt_data["pid"]):
+            say(text=t("fork_pid_exited", pid=opt_data['pid']), thread_ts=thread_ts)
+            return True
+        _execute_fork(opt_data, channel_id, say, thread_ts, user_id, initial_input)
+    else:
+        # ブリッジセッション
+        s = opt_data["session"]
+        _execute_fork_session(
+            source_session_id=s.claude_session_id,
+            cwd=s.working_dir,
+            channel_id=channel_id,
+            say=say,
+            thread_ts=thread_ts,
+            user_id=user_id,
+            initial_input=initial_input,
+            source_label=s.display_label or s.claude_session_id[:12],
+        )
     return True
 
 
