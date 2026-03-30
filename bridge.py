@@ -1164,6 +1164,42 @@ def _monitor_session_jsonl(inst: dict, thread_ts: str, channel: str, client: Web
                     if text:
                         task_ref.result = text
 
+    def _collapse_status_lines(lines: list[str]) -> str:
+        """ステータス行を折りたたみ表示: 完了済みツールはコンパクトに、最新のみ詳細表示"""
+        if not lines:
+            return ""
+        # thinkingとtool行を分離
+        thinking_line = None
+        tool_lines = []
+        for line in lines:
+            if line.startswith(":thought_balloon:"):
+                thinking_line = line
+            else:
+                tool_lines.append(line)
+        parts = []
+        if thinking_line:
+            parts.append(thinking_line)
+        if len(tool_lines) <= 2:
+            # 少数ならそのまま表示
+            parts.extend(tool_lines)
+        else:
+            # 完了済み（最後以外）はツール名だけコンパクトに表示
+            completed_names = []
+            for line in tool_lines[:-1]:
+                # `:wrench: `ToolName` summary` or `:robot_face: `Task` label` 形式からツール名を抽出
+                m = re.search(r"`([^`]+)`", line)
+                if m:
+                    completed_names.append(f"`{m.group(1)}`")
+                elif line.startswith("  ↳"):
+                    continue  # サブエージェント行はスキップ
+                else:
+                    completed_names.append("...")
+            if completed_names:
+                parts.append(f":white_check_mark: {' '.join(completed_names)} ({len(completed_names)})")
+            # 最新のツール行はフル表示
+            parts.append(tool_lines[-1])
+        return "\n".join(parts)
+
     def _flush_progress(final: bool = False):
         """進捗メッセージを更新（テキスト応答 + ステータス行を1メッセージに統合）。
         final=Trueで⏳を除去。"""
@@ -1181,7 +1217,7 @@ def _monitor_session_jsonl(inst: dict, thread_ts: str, channel: str, client: Web
                 display = display[:max_text] + "\n" + t("status_continued")
             parts.append(f":speech_balloon: {display_prefix}\n{display}")
         if status_lines:
-            status_text = "\n".join(status_lines)
+            status_text = _collapse_status_lines(status_lines)
             # ステータス部分が長すぎる場合は切り詰め
             max_status = available // 2
             if len(status_text) > max_status:
