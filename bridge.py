@@ -506,6 +506,8 @@ class Task:
     output_tokens: int = 0
     cache_read_tokens: int = 0
     cache_creation_tokens: int = 0
+    # ファイル変更差分（Edit/Write検出時に蓄積）
+    file_diffs: list = field(default_factory=list)
 
     # プロセス管理（実行中のみ）
     process: Optional[subprocess.Popen] = None
@@ -1159,6 +1161,9 @@ def _monitor_session_jsonl(inst: dict, thread_ts: str, channel: str, client: Web
                         "name": tool_name,
                         "input": _summarize_input(tool_input) if isinstance(tool_input, dict) else str(tool_input)[:80],
                     })
+                    # Edit/MultiEdit のdiff蓄積
+                    if isinstance(tool_input, dict) and tool_name in ("Edit", "MultiEdit"):
+                        _capture_edit_diff(task_ref, tool_name, tool_input)
                 elif c.get("type") == "text":
                     text = c.get("text", "").strip()
                     if text:
@@ -2500,6 +2505,14 @@ class ClaudeCodeRunner:
                 "filename": f"progress_{task.short_id}.txt",
                 "title": t("status_history_title"),
             })
+        # Edit差分ファイル
+        if task.file_diffs:
+            diff_content = "\n\n".join(task.file_diffs)
+            file_uploads.append({
+                "content": diff_content,
+                "filename": f"changes_{task.short_id}.diff",
+                "title": "Changes",
+            })
         if file_uploads:
             try:
                 self.client.files_upload_v2(
@@ -2660,6 +2673,32 @@ class ClaudeCodeRunner:
         for channel_id in list(self.projects.keys()):
             cancelled += self.cancel_all_in_project(channel_id)
         return cancelled
+
+
+def _capture_edit_diff(task: Task, tool_name: str, tool_input: dict):
+    """Edit/MultiEdit ツール入力からunified diff形式の差分を生成しタスクに蓄積"""
+    edits = []
+    if tool_name == "Edit":
+        fp = tool_input.get("file_path", "?")
+        old = tool_input.get("old_string", "")
+        new = tool_input.get("new_string", "")
+        if old or new:
+            edits.append((fp, old, new))
+    elif tool_name == "MultiEdit":
+        fp = tool_input.get("file_path", "?")
+        for edit in tool_input.get("edits", []):
+            if isinstance(edit, dict):
+                old = edit.get("old_string", "")
+                new = edit.get("new_string", "")
+                if old or new:
+                    edits.append((fp, old, new))
+    for fp, old, new in edits:
+        diff_lines = [f"--- a/{fp}", f"+++ b/{fp}", "@@ edit @@"]
+        for line in old.splitlines():
+            diff_lines.append(f"-{line}")
+        for line in new.splitlines():
+            diff_lines.append(f"+{line}")
+        task.file_diffs.append("\n".join(diff_lines))
 
 
 def _summarize_input(input_data: dict) -> str:
