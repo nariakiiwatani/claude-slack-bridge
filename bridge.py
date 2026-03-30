@@ -1211,7 +1211,18 @@ def _monitor_session_jsonl(inst: dict, thread_ts: str, channel: str, client: Web
         nonlocal status_msg_ts
         if not status_lines and not latest_text:
             return
-        suffix = "" if final else "\n" + t("status_running")
+        if final:
+            suffix = ""
+        else:
+            # 進捗バー風サフィックス: ツール使用回数サマリーを付与
+            progress_extra = ""
+            if task_ref and task_ref.tool_calls:
+                from collections import Counter
+                tool_counts = Counter(tc["name"] for tc in task_ref.tool_calls)
+                top_tools = " ".join(f"{name}({cnt})" for name, cnt in tool_counts.most_common(5))
+                elapsed = (datetime.now() - task_ref.started_at).total_seconds() if task_ref.started_at else 0
+                progress_extra = f"  |  {elapsed:.0f}s · {top_tools}"
+            suffix = "\n" + t("status_running") + progress_extra
         available = MAX_SLACK_MSG_LENGTH - len(suffix)
         parts = []
         if latest_text:
