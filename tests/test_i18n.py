@@ -130,6 +130,13 @@ class TestFormatVariables:
             "label": "Option A",
             "num": 1,
             "question": "Which?",
+            "cost": 0.0123,
+            "input": "1.2K",
+            "output": "500",
+            "cache_read": "10K",
+            "dir": "my-project",
+            "tool": "Bash",
+            "summary": "npm test",
         }
 
         for lang in ("ja", "en"):
