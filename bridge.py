@@ -501,6 +501,11 @@ class Task:
     allowed_tools: Optional[str] = None
     disallowed_tools: Optional[str] = None  # None=デフォルト(AskUserQuestion,ExitPlanMode), 明示値で上書き
     user_id: Optional[str] = None
+    # トークン使用量（JSONLのassistantエントリから累積）
+    input_tokens: int = 0
+    output_tokens: int = 0
+    cache_read_tokens: int = 0
+    cache_creation_tokens: int = 0
 
     # プロセス管理（実行中のみ）
     process: Optional[subprocess.Popen] = None
@@ -1135,8 +1140,15 @@ def _monitor_session_jsonl(inst: dict, thread_ts: str, channel: str, client: Web
                 result_text = result_data
             if result_text:
                 task_ref.result = result_text
-        # tool_calls and text from assistant messages
+        # tool_calls, text, and token usage from assistant messages
         if entry_type == "assistant" and isinstance(msg, dict):
+            # トークン使用量の累積
+            usage = msg.get("usage", {})
+            if isinstance(usage, dict):
+                task_ref.input_tokens += usage.get("input_tokens", 0)
+                task_ref.output_tokens += usage.get("output_tokens", 0)
+                task_ref.cache_read_tokens += usage.get("cache_read_input_tokens", 0)
+                task_ref.cache_creation_tokens += usage.get("cache_creation_input_tokens", 0)
             for c in msg.get("content", []):
                 if not isinstance(c, dict):
                     continue
@@ -2290,6 +2302,27 @@ class ClaudeCodeRunner:
             if len(task.tool_calls) > 10:
                 tools_summary += t("task_tools_more", count=len(task.tool_calls) - 10)
             parts.append(t("task_tools_used", count=len(task.tool_calls), tools=tools_summary))
+        # トークン使用量・コスト表示
+        if task.input_tokens > 0 or task.output_tokens > 0:
+            def _fmt_tokens(n: int) -> str:
+                if n >= 1_000_000:
+                    return f"{n / 1_000_000:.1f}M"
+                if n >= 1_000:
+                    return f"{n / 1_000:.1f}K"
+                return str(n)
+            token_line = t("task_tokens",
+                           input=_fmt_tokens(task.input_tokens),
+                           output=_fmt_tokens(task.output_tokens),
+                           cache_read=_fmt_tokens(task.cache_read_tokens))
+            # コスト概算（Sonnet 4 料金: input $3/M, output $15/M, cache_read $0.30/M, cache_creation $3.75/M）
+            cost = (
+                task.input_tokens * 3.0 / 1_000_000
+                + task.output_tokens * 15.0 / 1_000_000
+                + task.cache_read_tokens * 0.30 / 1_000_000
+                + task.cache_creation_tokens * 3.75 / 1_000_000
+            )
+            token_line += "  " + t("task_cost_estimate", cost=cost)
+            parts.append(token_line)
         full_result = None
         if show_result and task.result:
             result_text = _md_to_slack(task.result)
