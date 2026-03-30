@@ -2308,9 +2308,15 @@ class ClaudeCodeRunner:
                 task.status = TaskStatus.FAILED
                 task.error = stderr_output
                 task.completed_at = datetime.now()
+                # エラーコンテキスト: 最後のツール呼び出しを表示
+                error_parts = [f"{display_label}  {t('task_failed', code=proc.returncode)}"]
+                if task.tool_calls:
+                    last_tc = task.tool_calls[-1]
+                    error_parts.append(t("task_last_action", tool=last_tc["name"], summary=last_tc.get("input", "")[:100]))
+                error_parts.append(f"```{stderr_output[:1000]}```")
                 self._post_completion(
                     session, task,
-                    f"{display_label}  {t('task_failed', code=proc.returncode)}\n```{stderr_output[:1000]}```",
+                    "\n".join(error_parts),
                     inst,
                 )
 
@@ -2322,8 +2328,12 @@ class ClaudeCodeRunner:
             task.status = TaskStatus.FAILED
             task.error = str(e)
             task.completed_at = datetime.now()
+            error_parts = [f"{display_label}  {t('task_error', error=e)}"]
+            if task.tool_calls:
+                last_tc = task.tool_calls[-1]
+                error_parts.append(t("task_last_action", tool=last_tc["name"], summary=last_tc.get("input", "")[:100]))
             self._post_completion(session, task,
-                                  f"{display_label}  {t('task_error', error=e)}", inst)
+                                  "\n".join(error_parts), inst)
             self._cleanup_status_message(inst, session, task)
 
         finally:
