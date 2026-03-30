@@ -3463,7 +3463,7 @@ def _slack_thread_link(channel_id: str, thread_ts: str) -> str:
 
 
 def _handle_status(say, thread_ts, channel_id: str):
-    """プロジェクトスコープのタスク状態一覧"""
+    """プロジェクトスコープのタスク状態一覧（Block Kit）"""
     project = runner.get_project(channel_id)
     if not project:
         say(text=t("status_no_tasks"), thread_ts=thread_ts)
@@ -3471,8 +3471,7 @@ def _handle_status(say, thread_ts, channel_id: str):
 
     active_sessions = project.active_sessions
     if not active_sessions:
-        # 直近の完了タスクを表示
-        # タスク→セッションのマッピングを構築
+        # 直近の完了タスクをBlock Kitで表示
         task_session_map: dict[int, Session] = {}
         for session in project.sessions.values():
             for tk in session.tasks:
@@ -3480,7 +3479,7 @@ def _handle_status(say, thread_ts, channel_id: str):
         all_tasks = project.all_tasks
         recent = [tk for tk in all_tasks if tk.status in (TaskStatus.COMPLETED, TaskStatus.FAILED, TaskStatus.CANCELLED)][-5:]
         if recent:
-            lines = [t("status_no_running_with_recent")]
+            blocks = [{"type": "section", "text": {"type": "mrkdwn", "text": t("status_no_running_with_recent")}}]
             for tk in reversed(recent):
                 emoji = ":white_check_mark:" if tk.status == TaskStatus.COMPLETED else ":x:"
                 elapsed_str = ""
@@ -3491,13 +3490,17 @@ def _handle_status(say, thread_ts, channel_id: str):
                 if session:
                     link_url = _slack_thread_link(channel_id, session.thread_ts)
                     thread_link = f"  <{link_url}|:speech_balloon:>"
-                lines.append(f"{emoji} {tk.short_id} {tk.prompt[:40]}{elapsed_str}{thread_link}")
-            say(text="\n".join(lines), thread_ts=thread_ts)
+                blocks.append({
+                    "type": "section",
+                    "text": {"type": "mrkdwn", "text": f"{emoji} {tk.short_id} {tk.prompt[:40]}{elapsed_str}{thread_link}"},
+                })
+            fallback = t("status_no_running_with_recent")
+            say(text=fallback, blocks=blocks, thread_ts=thread_ts)
         else:
             say(text=t("status_no_running_tasks"), thread_ts=thread_ts)
         return
 
-    lines = [t("status_running_tasks_header", count=len(active_sessions))]
+    blocks = [{"type": "section", "text": {"type": "mrkdwn", "text": t("status_running_tasks_header", count=len(active_sessions))}}]
     for session in active_sessions:
         task = session.active_task
         if not task:
@@ -3505,20 +3508,37 @@ def _handle_status(say, thread_ts, channel_id: str):
         elapsed = (datetime.now() - task.started_at).total_seconds() if task.started_at else 0
         prompt_preview = task.prompt[:50] + ("..." if len(task.prompt) > 50 else "")
         tool_count = len(task.tool_calls)
-
-        user_info = f"  <@{task.user_id}>" if task.user_id else ""
         thread_link_url = _slack_thread_link(channel_id, session.thread_ts)
-        thread_link = f"  <{thread_link_url}|:speech_balloon:>"
-        lines.append(
-            f"\n{session.label_emoji} {task.short_id}"
-            f"  {t('status_elapsed_tools', elapsed=elapsed, tool_count=tool_count)}{user_info}{thread_link}\n"
-            f"> {prompt_preview}"
-        )
-        if task.tool_calls:
-            recent_tools = " -> ".join(f"`{tc['name']}`" for tc in task.tool_calls[-3:])
-            lines.append(f"  {t('status_recent_tools', tools=recent_tools)}")
 
-    say(text="\n".join(lines), thread_ts=thread_ts)
+        # カード風のセクションブロック（fieldsで構造化表示）
+        dir_name = os.path.basename(session.working_dir) if session.working_dir else "?"
+        user_field = f"<@{task.user_id}>" if task.user_id else "-"
+        recent_tools = ""
+        if task.tool_calls:
+            recent_tools = " → ".join(f"`{tc['name']}`" for tc in task.tool_calls[-3:])
+
+        blocks.append({"type": "divider"})
+        blocks.append({
+            "type": "section",
+            "text": {
+                "type": "mrkdwn",
+                "text": f"{session.label_emoji} {task.short_id}  <{thread_link_url}|:speech_balloon:>\n> {prompt_preview}",
+            },
+            "fields": [
+                {"type": "mrkdwn", "text": f"*Dir:* `{dir_name}`"},
+                {"type": "mrkdwn", "text": f"*User:* {user_field}"},
+                {"type": "mrkdwn", "text": f"*Time:* {elapsed:.0f}s"},
+                {"type": "mrkdwn", "text": f"*Tools:* {tool_count}"},
+            ],
+        })
+        if recent_tools:
+            blocks.append({
+                "type": "context",
+                "elements": [{"type": "mrkdwn", "text": t("status_recent_tools", tools=recent_tools)}],
+            })
+
+    fallback = t("status_running_tasks_header", count=len(active_sessions))
+    say(text=fallback, blocks=blocks, thread_ts=thread_ts)
 
 
 def _handle_cancel(text: str, say, thread_ts, channel_id: str):
