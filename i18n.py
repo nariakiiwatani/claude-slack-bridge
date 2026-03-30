@@ -199,6 +199,7 @@ MESSAGES: dict[str, dict[str, str]] = {
         # ── tools ──
         "tools_set": ":wrench: このセッションの次のタスクの許可ツール: `{tools}`\n続けてタスクを送信してください",
         "tool_request_message": ":wrench: 以下のツールの実行許可が必要です:\n{tools}",
+        "tool_request_context": ":file_folder: `{dir}`",
         "tool_request_approve_once": "一回のみ許可",
         "tool_request_approve_session": "セッション中許可",
         "tool_request_approve_project": "プロジェクト中許可",
@@ -432,6 +433,7 @@ MESSAGES: dict[str, dict[str, str]] = {
         # ── tools ──
         "tools_set": ":wrench: Allowed tools for next task in this session: `{tools}`\nSend a task to continue",
         "tool_request_message": ":wrench: The following tools need permission to run:\n{tools}",
+        "tool_request_context": ":file_folder: `{dir}`",
         "tool_request_approve_once": "Allow once",
         "tool_request_approve_session": "Allow for session",
         "tool_request_approve_project": "Allow for project",

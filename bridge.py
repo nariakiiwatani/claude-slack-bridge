@@ -2466,6 +2466,12 @@ class ClaudeCodeRunner:
             "user_id": task.user_id,
         }
         tools_display = ", ".join(f"`{t_}`" for t_ in requested_tools)
+        # コンテキスト情報を構築（作業ディレクトリ）
+        dir_name = os.path.basename(session.working_dir) if session.working_dir else ""
+        context_line = t("tool_request_context", dir=dir_name) if dir_name else ""
+        msg_text = t("tool_request_message", tools=tools_display)
+        if context_line:
+            msg_text += "\n" + context_line
         # ボタンのvalueにJSON埋め込み（セッション識別用）
         value_data = json.dumps({
             "thread_ts": session.thread_ts,
@@ -2477,8 +2483,11 @@ class ClaudeCodeRunner:
                 "type": "section",
                 "text": {
                     "type": "mrkdwn",
-                    "text": t("tool_request_message", tools=tools_display),
+                    "text": msg_text,
                 },
+            },
+            {
+                "type": "divider",
             },
             {
                 "type": "actions",
@@ -2517,7 +2526,7 @@ class ClaudeCodeRunner:
             self.client.chat_postMessage(
                 channel=session.channel_id,
                 thread_ts=session.thread_ts,
-                text=t("tool_request_message", tools=tools_display),
+                text=msg_text,
                 blocks=blocks,
             )
         except Exception as e:
