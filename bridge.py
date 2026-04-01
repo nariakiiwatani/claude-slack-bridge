@@ -2215,17 +2215,21 @@ class ClaudeCodeRunner:
             self._update_lifecycle_msg(session, task, running_text)
 
             # JONLファイルが現れるまでポーリング（プロセス終了まで探し続ける）
-            # resumeタスクの場合、既存JSONLのbirthtimeはstart_timeより古いため
-            # min_ctimeなしでも検索する
+            # resumeタスクの場合、session_idからファイル名で直接特定する
+            # （cwdマッチングでは同一ディレクトリの別セッションJSONLを掴むリスクがある）
+            # 初回・forkタスクではsession_idが未知のためcwdマッチングを使用
             jsonl_path = None
             jsonl_is_existing = False  # resume時に既存ファイルが見つかった場合True
             poll_i = 0
             while proc.poll() is None:
-                found = _find_session_jsonl(cwd, min_ctime=start_time, exclude_paths=_monitored_jsonl_paths)
-                if not found and is_resume:
-                    found = _find_session_jsonl(cwd, min_mtime=start_time, exclude_paths=_monitored_jsonl_paths)
+                if is_resume and task.resume_session:
+                    # resume: ファイル名（=session_id）で直接特定
+                    found = _find_jsonl_path_for_session_id(task.resume_session)
                     if found:
                         jsonl_is_existing = True
+                else:
+                    # 初回・fork: cwdマッチング（新規ファイルのみ）
+                    found = _find_session_jsonl(cwd, min_ctime=start_time, exclude_paths=_monitored_jsonl_paths)
                 if found:
                     jsonl_path = found
                     _monitored_jsonl_paths.add(jsonl_path)
@@ -2289,7 +2293,10 @@ class ClaudeCodeRunner:
 
             # JSONL からsession_idを取得できなかった場合のフォールバック
             if not session.claude_session_id:
-                fallback_path = jsonl_path or _find_session_jsonl(cwd, min_ctime=start_time, exclude_paths=_monitored_jsonl_paths) or (is_resume and _find_session_jsonl(cwd, min_mtime=start_time, exclude_paths=_monitored_jsonl_paths))
+                if is_resume and task.resume_session:
+                    fallback_path = jsonl_path or _find_jsonl_path_for_session_id(task.resume_session)
+                else:
+                    fallback_path = jsonl_path or _find_session_jsonl(cwd, min_ctime=start_time, exclude_paths=_monitored_jsonl_paths)
                 logger.debug("_execute: session_id not acquired, trying fallback fallback_path=%s jsonl_monitored=%s pid=%d thread=%s",
                              fallback_path, jsonl_monitored, proc.pid, thread_ts)
                 if fallback_path:
