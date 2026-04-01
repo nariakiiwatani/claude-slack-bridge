@@ -137,6 +137,9 @@ class TestFormatVariables:
             "dir": "my-project",
             "tool": "Bash",
             "summary": "npm test",
+            "name": "researcher",
+            "agent_type": "Explore",
+            "desc": "investigate API",
         }
 
         for lang in ("ja", "en"):

@@ -17,6 +17,8 @@ MESSAGES: dict[str, dict[str, str]] = {
             "• `@bot bind <PID>` → ターミナルのclaude CLIにライブ接続\n"
             "• `@bot bind` → バインド可能なプロセス一覧\n"
             "• `@bot <タスク>` → ディレクトリ選択画面から実行\n"
+            "• `@bot team in <path> <タスク>` → Team Agentで並列実行\n"
+            "• `@bot team <タスク>` → Team Agentで並列実行（root設定時）\n"
             "*スレッド返信:*\n"
             "• `<指示>` → 同セッションで自動続行（メンション不要）\n"
             "• `@bot cancel` → このスレッドのタスクをキャンセル\n"
@@ -199,6 +201,18 @@ MESSAGES: dict[str, dict[str, str]] = {
             "`root <絶対パス>` で再設定するか `root clear` で解除してください"
         ),
 
+        # ── team ──
+        "team_usage": ":warning: 使い方: `team in <path> <タスク>` または `team <タスク>`（root設定時）",
+        "team_prompt_prefix": (
+            "このタスクはTeam Agent機能を使って並列に実行してください。\n"
+            "1. TeamCreateでチームを作成\n"
+            "2. タスクを分析して並列実行可能なサブタスクに分解\n"
+            "3. 各サブタスクに適切なsubagent_type（Explore=調査, general-purpose=実装, Plan=設計）のチームメイトをAgentツールで生成\n"
+            "4. TaskCreate/TaskUpdateでタスク管理し、完了後にTeamDeleteでクリーンアップ\n"
+            "\n実際のタスク:\n"
+        ),
+        "team_subagent_label": ":busts_in_silhouette: `{name}` ({agent_type}) {desc}",
+
         # ── tools ──
         "tools_set": ":wrench: このセッションの次のタスクの許可ツール: `{tools}`\n続けてタスクを送信してください",
         "tool_request_message": ":wrench: 以下のツールの実行許可が必要です:\n{tools}",
@@ -254,6 +268,8 @@ MESSAGES: dict[str, dict[str, str]] = {
             "• `@bot bind <PID>` → Live-connect to a terminal Claude CLI\n"
             "• `@bot bind` → List bindable processes\n"
             "• `@bot <task>` → Run from directory selection\n"
+            "• `@bot team in <path> <task>` → Run with Team Agent (parallel)\n"
+            "• `@bot team <task>` → Run with Team Agent (when root is set)\n"
             "*Thread replies:*\n"
             "• `<instruction>` → Continue in same session (no mention needed)\n"
             "• `@bot cancel` → Cancel this thread's task\n"
@@ -435,6 +451,18 @@ MESSAGES: dict[str, dict[str, str]] = {
             ":warning: Root directory not found: `{path}`\n"
             "Set a new one with `root <absolute-path>` or clear with `root clear`"
         ),
+
+        # ── team ──
+        "team_usage": ":warning: Usage: `team in <path> <task>` or `team <task>` (when root is set)",
+        "team_prompt_prefix": (
+            "Use the Team Agent feature to execute this task in parallel.\n"
+            "1. Create a team with TeamCreate\n"
+            "2. Analyze the task and decompose it into parallelizable subtasks\n"
+            "3. Spawn teammates with the Agent tool using appropriate subagent_type (Explore=research, general-purpose=implementation, Plan=design)\n"
+            "4. Manage tasks with TaskCreate/TaskUpdate, then clean up with TeamDelete when done\n"
+            "\nActual task:\n"
+        ),
+        "team_subagent_label": ":busts_in_silhouette: `{name}` ({agent_type}) {desc}",
 
         # ── tools ──
         "tools_set": ":wrench: Allowed tools for next task in this session: `{tools}`\nSend a task to continue",

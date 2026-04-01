@@ -8,9 +8,10 @@ A bridge that lets users control Claude Code (CLI) from Slack on their Mac. Mult
 
 Channel mode only: Whitelisted users/channels (`SLACK_ALLOWED_USERS`, `SLACK_ALLOWED_CHANNELS`). Requires `@bot` mention for all commands (top-level and in-thread). Thread replies without mention are forwarded to CLI or create resume tasks.
 
-Tasks are started with a directory specified at invocation time via three methods:
+Tasks are started with a directory specified at invocation time via four methods:
 - `@bot in <path> <task>` — run in specified directory
 - `@bot fork <PID> [<task>]` — fork a running Claude CLI process
+- `@bot team [in <path>] <task>` — run with Team Agent (parallel subtasks via multiple agents)
 - `@bot <task>` — select from fork candidates / directory history in a thread
 
 Terminal-Slack bidirectional sync:
@@ -68,13 +69,15 @@ Main logic is in `bridge.py`. Internationalization is in `i18n.py` (bilingual ja
 
 - **External takeover** — When a bridge-spawned task is running and an external `claude --resume` process is detected with the same `session_id`, the bridge kills its subprocess, switches the `inst` to the external process, and continues monitoring. Active task takeover is checked every ~15s inside `_monitor_session_jsonl` (via `_TAKEOVER_CHECK_INTERVAL`). Idle session takeover (for sessions with no active task) is detected by a separate thread `_idle_takeover_monitor_loop` (via `_IDLE_TAKEOVER_INTERVAL`). Note: Slack thread displays a truncated session ID (first 12 chars) for reference only — to resume from terminal, use `claude --resume` without args to open the interactive session picker.
 
+- **team** — `team [in <path>] <task>` runs a task using Claude Code's Team Agent feature. `_handle_team` injects a team instruction prefix into the prompt and adds Team-related tools (`TeamCreate`, `TeamDelete`, `SendMessage`, `TaskCreate`, `TaskUpdate`, `TaskList`, `Agent`) to `allowedTools`. The Team Lead runs as a normal task in the session; teammates are subagents whose JSONL output is monitored by the existing subagent monitoring (`_read_subagent_jsonl_entries`). Teammate progress is displayed with `:busts_in_silhouette:` labels showing their name and type.
+
 - **Bare task** — When `@bot <task>` is sent without `in` or `fork`, `_handle_bare_task` shows fork candidates and directory history for selection. Selection state is stored in `pending_directory_requests`.
 
 ### Data Flow
 
 1. Message event arrives via Socket Mode → `handle_message` routes by `channel_type`
 2. Channel/user whitelist check → mention detection / thread reply routing → command parsing
-3. `_dispatch_command` parses the command. `in` → `_handle_in_dir` → `_start_task_in_dir`. `fork` → `_handle_fork` / `_handle_fork_list`. `bind` → `_handle_bind` / `_handle_bind_list` → `_execute_bind`. `root` → `_handle_root` (persists to `channel_roots.json`). Bare task → `_handle_bare_task` → directory selection → `_start_task_in_dir` or `_execute_fork`.
+3. `_dispatch_command` parses the command. `in` → `_handle_in_dir` → `_start_task_in_dir`. `team` → `_handle_team` (injects team prompt prefix + extra tools, then starts task). `fork` → `_handle_fork` / `_handle_fork_list`. `bind` → `_handle_bind` / `_handle_bind_list` → `_execute_bind`. `root` → `_handle_root` (persists to `channel_roots.json`). Bare task → `_handle_bare_task` → directory selection → `_start_task_in_dir` or `_execute_fork`.
 4. Thread spawns `claude -p --verbose` subprocess with PTY, pipes prompt via stdin. Thread replies to existing sessions automatically use `--resume <session.claude_session_id>`
 5. JSONL output file is monitored for progress (including subagent JSONL files under `subagents/`); session's `claude_session_id` is updated from JSONL entries
 6. On completion/failure, posts final result to Slack thread

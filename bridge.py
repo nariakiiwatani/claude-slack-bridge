@@ -15,6 +15,7 @@ Mac上で動くClaude CodeをSlackから操作するブリッジ。
   fork <PID> [<タスク>]     → 実行中のclaude CLIプロセスをフォーク
   fork                      → フォーク可能なプロセス一覧
   <タスク内容>              → ディレクトリ選択画面からタスクを実行（root設定時は即実行）
+  team [in <path>] <タスク> → Team Agentモードで並列実行
   root [<path>|clear]       → チャンネルのルートディレクトリ設定/表示/解除
   status                    → タスクの状態一覧
   sessions                  → セッション一覧
@@ -97,6 +98,9 @@ DIRECTORY_HISTORY_MAX = 10
 SESSIONS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "sessions.json")
 SESSIONS_MAX_AGE_DAYS = 7
 SESSIONS_MAX_PER_CHANNEL = 50
+
+# Team Agent用追加ツール
+TEAM_EXTRA_TOOLS = "TeamCreate,TeamDelete,SendMessage,TaskCreate,TaskUpdate,TaskList,Agent"
 
 # ツールリクエストマーカー検出用正規表現
 _TOOL_REQUEST_RE = re.compile(r"\[TOOL_REQUEST:([^\]]+)\]")
@@ -891,12 +895,22 @@ def _classify_jsonl_entry(entry: dict) -> list[tuple[str, str, dict | None]]:
                     results.append(("question", formatted, meta))
                     continue
 
-            # Task（サブエージェント）表示改善
-            if tool_name == "Task":
-                desc = tool_input.get("description", "") if isinstance(tool_input, dict) else ""
-                stype = tool_input.get("subagent_type", "") if isinstance(tool_input, dict) else ""
-                label = f"{stype}: {desc}" if stype and desc else (desc or stype or "subagent")
-                results.append(("status", f":robot_face: `Task` {label}", None))
+            # Task/Agent（サブエージェント）表示改善
+            if tool_name in ("Task", "Agent"):
+                if isinstance(tool_input, dict):
+                    desc = tool_input.get("description", "")
+                    stype = tool_input.get("subagent_type", "")
+                    team = tool_input.get("team_name", "")
+                    name = tool_input.get("name", "")
+                else:
+                    desc, stype, team, name = "", "", "", ""
+                if team and name:
+                    # チームメイト表示
+                    label = t("team_subagent_label", name=name, agent_type=stype or "agent", desc=desc)
+                    results.append(("status", label, None))
+                else:
+                    label = f"{stype}: {desc}" if stype and desc else (desc or stype or "subagent")
+                    results.append(("status", f":robot_face: `{tool_name}` {label}", None))
                 continue
 
             summary = _summarize_input(tool_input) if isinstance(tool_input, dict) else str(tool_input)[:80]
@@ -3104,6 +3118,12 @@ def _dispatch_command(text: str, event: dict, say):
         )
         return
 
+    # ── team [in <path>] <タスク> ──
+    if cmd_lower == "team" or cmd_lower.startswith("team "):
+        rest = text[4:].strip()
+        _handle_team(rest, say, thread_ts, channel_id, user_id, _resolve_event_files(event, channel_id))
+        return
+
     # ── root [<path>|clear] ──
     if cmd_lower == "root" or cmd_lower.startswith("root "):
         _handle_root(text, say, thread_ts, channel_id)
@@ -3637,6 +3657,79 @@ def _handle_cancel_in_thread(say, thread_ts: str, channel_id: str):
         say(text=t("task_cancel_request_sent", task_id=task_id), thread_ts=thread_ts)
     else:
         say(text=t("task_not_running", task_id=task_id), thread_ts=thread_ts)
+
+
+def _handle_team(rest: str, say, thread_ts: str, channel_id: str,
+                  user_id: str = "", files: list[dict] | None = None):
+    """team [in <path>] <タスク> — Team Agentモードでタスク実行。
+    プロンプトにチーム指示を注入し、allowedToolsにTeam系ツールを追加する。"""
+    if not rest:
+        say(text=t("team_usage"), thread_ts=thread_ts)
+        return
+
+    # "team in <path> <task>" 形式のパース
+    rest_lower = rest.lower()
+    if rest_lower.startswith("in "):
+        inner = rest[3:].strip()
+        parts = inner.split(maxsplit=1)
+        if len(parts) < 2:
+            say(text=t("team_usage"), thread_ts=thread_ts)
+            return
+        dir_path, prompt = parts
+        dir_path = os.path.expanduser(dir_path)
+        if not os.path.isabs(dir_path):
+            root = runner.get_channel_root(channel_id)
+            if root:
+                dir_path = os.path.normpath(os.path.join(root, dir_path))
+            else:
+                say(text=t("error_absolute_path_with_root_hint", path=dir_path), thread_ts=thread_ts)
+                return
+    else:
+        # "team <task>" — root設定が必要
+        root = runner.get_channel_root(channel_id)
+        if not root:
+            say(text=t("team_usage"), thread_ts=thread_ts)
+            return
+        dir_path = root
+        prompt = rest
+
+    if not os.path.isdir(dir_path):
+        say(text=t("error_dir_not_found", path=dir_path), thread_ts=thread_ts)
+        return
+
+    # プロンプトにTeam Agent指示を注入
+    team_prompt = t("team_prompt_prefix") + prompt
+
+    # Team系ツールを追加した allowedTools でタスク起動
+    project = runner.get_or_create_project(channel_id)
+    session = project.get_or_create_session(thread_ts)
+    session.working_dir = dir_path
+    runner.record_directory(channel_id, dir_path)
+
+    if files:
+        file_paths = _download_slack_files(files, dir_path)
+        if file_paths:
+            team_prompt = _augment_prompt_with_files(team_prompt, file_paths)
+
+    # 既存ツールにTeam系ツールをマージ
+    base_tools = session.consume_tools() or DEFAULT_ALLOWED_TOOLS
+    base_set = set(t_.strip() for t_ in base_tools.split(",")) if base_tools else set()
+    team_set = set(t_.strip() for t_ in TEAM_EXTRA_TOOLS.split(","))
+    merged_tools = ",".join(sorted(base_set | team_set))
+
+    task = Task(
+        id=0,
+        prompt=team_prompt,
+        allowed_tools=merged_tools,
+        user_id=user_id,
+    )
+    runner.assign_task_id(task)
+    text = runner._build_lifecycle_text(session, task, "lifecycle_received")
+    runner._post_lifecycle_msg(session, task, text)
+
+    err = runner.run_task(project, session, task)
+    if err:
+        say(text=err, thread_ts=thread_ts)
 
 
 def _handle_root(text: str, say, thread_ts: str, channel_id: str):
