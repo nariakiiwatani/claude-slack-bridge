@@ -1099,6 +1099,9 @@ def _monitor_session_jsonl(inst: dict, thread_ts: str, channel: str, client: Web
     all_status_history: list[str] = []    # 全ステータス履歴（完了時スニペット用）
     last_posted_text: Optional[str] = None  # 重複投稿防止用
     latest_text: Optional[str] = None  # 最新のテキスト応答（進捗メッセージ内に表示）
+    last_jsonl_update: float = time.time()  # 最終JSONL更新時刻（ハートビート表示用）
+    _HEARTBEAT_INTERVAL = 30  # ハートビート更新間隔（秒）
+    _last_heartbeat: float = 0  # 前回ハートビート更新時刻
 
     # サブエージェント監視
     jsonl_dir = os.path.dirname(jsonl_path) if jsonl_path else ""
@@ -1236,6 +1239,11 @@ def _monitor_session_jsonl(inst: dict, thread_ts: str, channel: str, client: Web
                 top_tools = " ".join(f"{name}({cnt})" for name, cnt in tool_counts.most_common(5))
                 elapsed = (datetime.now() - task_ref.started_at).total_seconds() if task_ref.started_at else 0
                 progress_extra = f"  |  {elapsed:.0f}s · {top_tools}"
+            # 最終JSONL更新からの経過時間を表示（10秒以上経過時）
+            idle_secs = time.time() - last_jsonl_update
+            if idle_secs >= 10:
+                idle_str = f"{int(idle_secs)}s" if idle_secs < 60 else f"{int(idle_secs // 60)}m{int(idle_secs % 60):02d}s"
+                progress_extra += f"  |  {t('status_last_update', idle=idle_str)}"
             suffix = "\n" + t("status_running") + progress_extra
         available = MAX_SLACK_MSG_LENGTH - len(suffix)
         parts = []
@@ -1466,12 +1474,21 @@ def _monitor_session_jsonl(inst: dict, thread_ts: str, channel: str, client: Web
                                 all_status_history.append(f"  ↳ {text}")
                                 has_sub_status = True
                     if has_sub_status:
+                        last_jsonl_update = time.time()
                         _flush_progress()
                     continue
+
+            # ハートビート: JSONL更新がない間も定期的に進捗メッセージを更新
+            # （最終更新時刻の経過表示を更新するため）
+            now = time.time()
+            if status_msg_ts and (now - _last_heartbeat) >= _HEARTBEAT_INTERVAL:
+                _last_heartbeat = now
+                _flush_progress()
 
             continue
 
         # エントリを分類して処理
+        last_jsonl_update = time.time()
         text_parts: list[str] = []
         has_status = False
 

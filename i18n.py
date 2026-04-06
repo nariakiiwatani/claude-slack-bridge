@@ -37,6 +37,7 @@ MESSAGES: dict[str, dict[str, str]] = {
         # ── status ──
         "status_thinking": ":thought_balloon: _思考中..._ ({chars}文字)",
         "status_running": ":hourglass_flowing_sand: _実行中..._",
+        "status_last_update": "最終更新 {idle}前",
         "status_no_tasks": ":zzz: このチャンネルにはまだタスクがありません",
         "status_no_running_tasks": ":zzz: 実行中のタスクはありません",
         "status_no_running_with_recent": ":zzz: 実行中のタスクはありません\n*直近の完了タスク:*",
@@ -288,6 +289,7 @@ MESSAGES: dict[str, dict[str, str]] = {
         # ── status ──
         "status_thinking": ":thought_balloon: _Thinking..._ ({chars} chars)",
         "status_running": ":hourglass_flowing_sand: _Running..._",
+        "status_last_update": "last update {idle} ago",
         "status_no_tasks": ":zzz: No tasks in this channel yet",
         "status_no_running_tasks": ":zzz: No running tasks",
         "status_no_running_with_recent": ":zzz: No running tasks\n*Recent completed tasks:*",
