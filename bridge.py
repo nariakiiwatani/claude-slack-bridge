@@ -2596,12 +2596,29 @@ class ClaudeCodeRunner:
             self._check_tool_request(session, task)
         return
 
+    @staticmethod
+    def _normalize_tool_name(name: str) -> str:
+        """ツール名を --allowedTools 互換形式に正規化。
+        Bash(cmd pattern) はそのまま保持。それ以外のツール（Grep, Read 等）は
+        括弧付き引数（パス等）を除去してベース名のみにする。
+        例: Grep(/Users/foo) → Grep, Bash(npm install) → Bash(npm install)
+        """
+        paren_idx = name.find("(")
+        if paren_idx < 0:
+            return name
+        base = name[:paren_idx]
+        if base == "Bash":
+            return name  # Bash(pattern) は CLI がサポートする形式
+        return base
+
     def _check_tool_request(self, session: Session, task: Task):
         """タスク結果から [TOOL_REQUEST:...] マーカーを検出し、ボタン付きメッセージを投稿"""
         matches = _TOOL_REQUEST_RE.findall(task.result or "")
         if not matches:
             return
-        requested_tools = list(dict.fromkeys(matches))  # 重複排除、順序保持
+        # Bash 以外のツールは括弧部分を除去して正規化
+        normalized = [self._normalize_tool_name(m) for m in matches]
+        requested_tools = list(dict.fromkeys(normalized))  # 重複排除、順序保持
         logger.info("_check_tool_request: detected tool requests=%s thread=%s",
                      requested_tools, session.thread_ts)
         session.pending_tool_request = {
@@ -3470,6 +3487,11 @@ def _handle_tool_request_action(ack, body, scope: str):
     session = project.sessions.get(thread_ts) if project else None
     if not session:
         logger.warning("Tool request action: session not found thread=%s", thread_ts)
+        return
+
+    # 重複クリック防止: pending_tool_request が既にクリアされていたらスキップ
+    if session.pending_tool_request is None:
+        logger.info("Tool request action: already handled (duplicate click), thread=%s", thread_ts)
         return
 
     # ボタンメッセージを更新（ボタン除去）

@@ -590,3 +590,27 @@ class TestPlanApprovalMarker:
         # _post_plan_approval の処理を再現
         meta["questions"][0]["is_plan_approval"] = True
         assert meta["questions"][0]["is_plan_approval"] is True
+
+
+# ── _normalize_tool_name: ツール名正規化 ──────────────────
+
+class TestNormalizeToolName:
+    """Bash 以外のツールの括弧付き引数を除去する正規化テスト"""
+
+    def test_plain_tool_name(self):
+        assert bridge.ClaudeCodeRunner._normalize_tool_name("Grep") == "Grep"
+
+    def test_bash_pattern_preserved(self):
+        """Bash(pattern) はそのまま保持"""
+        assert bridge.ClaudeCodeRunner._normalize_tool_name("Bash(git *)") == "Bash(git *)"
+        assert bridge.ClaudeCodeRunner._normalize_tool_name("Bash(npm install)") == "Bash(npm install)"
+
+    def test_grep_path_stripped(self):
+        """Grep(/path) はベース名のみ"""
+        assert bridge.ClaudeCodeRunner._normalize_tool_name("Grep(/Users/foo/bar)") == "Grep"
+
+    def test_read_path_stripped(self):
+        assert bridge.ClaudeCodeRunner._normalize_tool_name("Read(/tmp/test.txt)") == "Read"
+
+    def test_no_parens(self):
+        assert bridge.ClaudeCodeRunner._normalize_tool_name("WebFetch") == "WebFetch"
