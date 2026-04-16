@@ -14,8 +14,13 @@ fi
 if launchctl list "$LABEL" &>/dev/null; then
     launchctl bootout "$DOMAIN/$LABEL"
     echo "停止しました"
-    # ThrottleInterval対策で少し待つ
-    sleep 2
+    # プロセス完全終了を待つ（bootoutは非同期の場合がある）
+    for i in $(seq 1 15); do
+        if ! launchctl list "$LABEL" &>/dev/null; then
+            break
+        fi
+        sleep 1
+    done
 fi
 
 launchctl bootstrap "$DOMAIN" "$PLIST_PATH"

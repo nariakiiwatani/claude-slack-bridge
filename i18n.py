@@ -178,6 +178,7 @@ MESSAGES: dict[str, dict[str, str]] = {
             "チャンネルで `@bot in <path> <タスク>` を送信してください"
         ),
         "notify_shutdown": ":wave: Claude Code Bridge を停止しました",
+        "notify_reconnected": ":warning: Slack接続が一時切断していました（{duration}間、{retries}回リトライ）。現在は復旧済みです。",
 
         # ── question (CLI質問表示) ──
         "question_cli_header": ":question: *CLIからの質問*",
@@ -430,6 +431,7 @@ MESSAGES: dict[str, dict[str, str]] = {
             "Send `@bot in <path> <task>` in a channel to begin"
         ),
         "notify_shutdown": ":wave: Claude Code Bridge stopped",
+        "notify_reconnected": ":warning: Slack connection was temporarily lost ({duration}, {retries} retries). Now recovered.",
 
         # ── question ──
         "question_cli_header": ":question: *Question from CLI*",

@@ -5175,47 +5175,209 @@ def main():
 
     handler = SocketModeHandler(app, SLACK_APP_TOKEN, trace_enabled=True)
 
-    # ── 連続エラー検知 → プロセス再起動 ──
-    # 短時間に連続してSocket Modeエラーが発生した場合、内部状態が壊れている
-    # 可能性が高いのでプロセスを終了し、launchctlに再起動させる
-    _SM_ERROR_WINDOW = 60       # 秒
-    _SM_ERROR_THRESHOLD = 5     # この回数以上で終了
-    _sm_error_times: list[float] = []
+    # ── 連続エラー検知 → エクスポネンシャルバックオフ再接続 ──
+    # Socket Modeエラーが連続する場合、SDKの自動再接続を無効にし、
+    # バックオフしながら自前で再接続を試みる。
+    # 最大リトライ回数を超えたらプロセスを終了し、launchctlに再起動させる。
+    _SM_BACKOFF_INITIAL = 2.0       # 初回待機秒数
+    _SM_BACKOFF_MAX = 120.0         # 最大待機秒数
+    _SM_BACKOFF_FACTOR = 2.0        # 倍率
+    _SM_MAX_RETRIES = 10            # この回数を超えたら終了
+    _SM_RESET_AFTER = 120.0         # エラーなしでこの秒数経過したらカウンタリセット
+    _sm_consecutive_errors = 0
+    _sm_last_error_time: float = 0.0
+    _sm_disconnect_since: float = 0.0   # 切断開始時刻 (0 = 切断中でない)
+    _sm_reconnecting = False            # バックオフ再接続処理中フラグ
 
-    def _on_socket_error(error: Exception):
-        now = time.time()
-        _sm_error_times.append(now)
-        # ウィンドウ外の古いエラーを除去
-        while _sm_error_times and _sm_error_times[0] < now - _SM_ERROR_WINDOW:
-            _sm_error_times.pop(0)
-        if len(_sm_error_times) >= _SM_ERROR_THRESHOLD:
-            logger.critical(
-                "Socket Mode で %d秒以内に %d回のエラーが発生。プロセスを終了し再起動します。",
-                _SM_ERROR_WINDOW, len(_sm_error_times),
+    def _macos_notify(title: str, message: str):
+        """macOS 通知センターに通知を表示する"""
+        try:
+            subprocess.Popen(
+                ["osascript", "-e",
+                 f'display notification "{message}" with title "{title}"'],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
             )
-            # セッション情報を保存してから終了
-            try:
-                runner.save_sessions()
-            except Exception:
-                pass
-            os._exit(1)
+        except Exception as e:
+            logger.debug("macOS notification failed: %s", e)
 
-    handler.client.on_error_listeners.append(_on_socket_error)
+    def _format_duration(seconds: int) -> str:
+        minutes = seconds // 60
+        secs = seconds % 60
+        if minutes > 0:
+            return f"{minutes}分{secs}秒"
+        return f"{secs}秒"
 
-    def shutdown(signum, frame):
-        logger.info("Shutting down...")
-        _shutdown_event.set()
-        runner.cancel_all()
+    def _notify_reconnected():
+        """接続回復時の通知（Slack + macOS）"""
+        elapsed = int(time.time() - _sm_disconnect_since)
+        logger.info(
+            "Socket Mode 接続回復（%d回リトライ、切断時間 %d秒）",
+            _sm_consecutive_errors, elapsed,
+        )
         if NOTIFICATION_CHANNEL:
             try:
                 slack_client.chat_postMessage(
                     channel=NOTIFICATION_CHANNEL,
-                    text=t("notify_shutdown"),
+                    text=t("notify_reconnected",
+                           retries=_sm_consecutive_errors,
+                           duration=_format_duration(elapsed)),
                 )
-            except Exception:
-                pass
-        handler.close()
-        sys.exit(0)
+            except Exception as e:
+                logger.warning("復旧通知の送信に失敗: %s", e)
+        _macos_notify(
+            "Claude Slack Bridge",
+            f"Slack接続が回復しました（切断 {_format_duration(elapsed)}）",
+        )
+
+    def _on_socket_error(error: Exception):
+        """エラー発生時: SDKの自動再接続を無効にし、バックオフ付き再接続スレッドを起動"""
+        nonlocal _sm_consecutive_errors, _sm_last_error_time, _sm_disconnect_since
+        nonlocal _sm_reconnecting
+        now = time.time()
+
+        # 前回エラーから十分時間が経過していればカウンタリセット
+        if _sm_last_error_time and (now - _sm_last_error_time) > _SM_RESET_AFTER:
+            _sm_consecutive_errors = 0
+            _sm_disconnect_since = 0.0
+
+        _sm_consecutive_errors += 1
+        _sm_last_error_time = now
+        if _sm_disconnect_since == 0.0:
+            _sm_disconnect_since = now
+
+        # SDKの自動再接続を無効化（モニタースレッドが勝手に再接続するのを防ぐ）
+        handler.client.auto_reconnect_enabled = False
+
+        logger.warning(
+            "Socket Mode エラー #%d: %s",
+            _sm_consecutive_errors, error,
+        )
+
+        # 初回切断時にmacOS通知
+        if _sm_consecutive_errors == 1:
+            _macos_notify(
+                "Claude Slack Bridge",
+                "Slack接続が切れました。自動再接続を試行中…",
+            )
+
+        # バックオフ再接続スレッドが未起動なら起動
+        if not _sm_reconnecting:
+            _sm_reconnecting = True
+            import threading
+            threading.Thread(
+                target=_backoff_reconnect_loop,
+                name="sm-backoff-reconnect",
+                daemon=True,
+            ).start()
+
+    def _backoff_reconnect_loop():
+        """バックオフ付き再接続ループ（専用スレッド）"""
+        nonlocal _sm_consecutive_errors, _sm_last_error_time
+        nonlocal _sm_disconnect_since, _sm_reconnecting
+        try:
+            while True:
+                delay = min(
+                    _SM_BACKOFF_INITIAL * (_SM_BACKOFF_FACTOR ** (_sm_consecutive_errors - 1)),
+                    _SM_BACKOFF_MAX,
+                )
+
+                if _sm_consecutive_errors >= _SM_MAX_RETRIES:
+                    elapsed = int(time.time() - _sm_disconnect_since)
+                    logger.critical(
+                        "Socket Mode で %d回連続エラー（%d秒間切断）。"
+                        "プロセスを終了し再起動します。",
+                        _sm_consecutive_errors, elapsed,
+                    )
+                    _macos_notify(
+                        "Claude Slack Bridge",
+                        f"接続エラーが{_sm_consecutive_errors}回連続。"
+                        "プロセスを再起動します。",
+                    )
+                    try:
+                        runner.save_sessions()
+                    except Exception:
+                        pass
+                    os._exit(1)
+
+                logger.info(
+                    "Socket Mode 再接続 #%d: %.1f秒後にリトライ",
+                    _sm_consecutive_errors, delay,
+                )
+                time.sleep(delay)
+
+                try:
+                    handler.client.connect_to_new_endpoint()
+                    # 成功 → 自動再接続を再有効化してカウンタリセット
+                    handler.client.auto_reconnect_enabled = (
+                        handler.client.default_auto_reconnect_enabled
+                    )
+                    if _sm_disconnect_since > 0:
+                        _notify_reconnected()
+                    _sm_consecutive_errors = 0
+                    _sm_last_error_time = 0.0
+                    _sm_disconnect_since = 0.0
+                    logger.info("Socket Mode 再接続成功")
+                    break
+                except Exception as e:
+                    _sm_consecutive_errors += 1
+                    _sm_last_error_time = time.time()
+                    logger.warning(
+                        "Socket Mode 再接続失敗 #%d: %s",
+                        _sm_consecutive_errors, e,
+                    )
+        finally:
+            _sm_reconnecting = False
+
+    def _on_message_received(client, message, raw_message):
+        """メッセージ受信成功 → エラーカウンタをリセット"""
+        nonlocal _sm_consecutive_errors, _sm_last_error_time, _sm_disconnect_since
+        if _sm_consecutive_errors > 0 and _sm_disconnect_since > 0:
+            _notify_reconnected()
+        _sm_consecutive_errors = 0
+        _sm_last_error_time = 0.0
+        _sm_disconnect_since = 0.0
+
+    handler.client.on_error_listeners.append(_on_socket_error)
+    handler.client.message_listeners.append(_on_message_received)
+
+    def shutdown(signum, frame):
+        logger.info("Shutting down...")
+        _shutdown_event.set()
+
+        # シャットダウン全体をワーカースレッドで実行し、デッドライン超過時は強制終了
+        def _shutdown_worker():
+            # 0. セッション保存
+            try:
+                runner.save_sessions()
+            except Exception as e:
+                logger.warning("save_sessions on shutdown failed: %s", e)
+            # 1. 停止通知（最優先）
+            if NOTIFICATION_CHANNEL:
+                try:
+                    slack_client.chat_postMessage(
+                        channel=NOTIFICATION_CHANNEL,
+                        text=t("notify_shutdown"),
+                    )
+                    logger.info("Shutdown notification sent")
+                except Exception as e:
+                    logger.warning("Failed to send Slack shutdown notification: %s", e)
+            # 2. タスクキャンセル
+            try:
+                runner.cancel_all()
+            except Exception as e:
+                logger.warning("cancel_all failed: %s", e)
+            # 3. Socket Mode切断
+            try:
+                handler.close()
+            except Exception as e:
+                logger.warning("handler.close failed: %s", e)
+
+        worker = threading.Thread(target=_shutdown_worker)
+        worker.start()
+        worker.join(timeout=15)
+        if worker.is_alive():
+            logger.warning("Shutdown timed out after 15s, forcing exit")
+        os._exit(0)
 
     signal.signal(signal.SIGINT, shutdown)
     signal.signal(signal.SIGTERM, shutdown)

@@ -45,10 +45,7 @@ cat > "$PLIST_PATH" <<EOF
     <true/>
 
     <key>KeepAlive</key>
-    <dict>
-        <key>Crashed</key>
-        <true/>
-    </dict>
+    <true/>
 
     <key>ThrottleInterval</key>
     <integer>10</integer>
