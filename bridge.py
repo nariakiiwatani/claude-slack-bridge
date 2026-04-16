@@ -292,7 +292,7 @@ def _resolve_event_files(event: dict, channel_id: str = "") -> list[dict]:
                 limit=1,
             )
             msgs = resp.get("messages", [])
-            if msgs:
+            if msgs and msgs[0].get("ts") == msg_ts:
                 refetched = msgs[0].get("files", [])
                 if refetched:
                     logger.info("Got %d files from conversations.history: %s",
