@@ -2235,12 +2235,14 @@ class ClaudeCodeRunner:
             # resumeタスクの場合、session_idからファイル名で直接特定する
             # （cwdマッチングでは同一ディレクトリの別セッションJSONLを掴むリスクがある）
             # 初回・forkタスクではsession_idが未知のためcwdマッチングを使用
+            # fork-sessionは新しいセッションIDで新規JSONLを作成するためcwdマッチングを使用
             jsonl_path = None
             jsonl_is_existing = False  # resume時に既存ファイルが見つかった場合True
+            is_fork = task.fork_session
             poll_i = 0
             while proc.poll() is None:
-                if is_resume and task.resume_session:
-                    # resume: ファイル名（=session_id）で直接特定
+                if is_resume and task.resume_session and not is_fork:
+                    # resume（非fork）: ファイル名（=session_id）で直接特定
                     found = _find_jsonl_path_for_session_id(task.resume_session)
                     if found:
                         jsonl_is_existing = True
@@ -2310,7 +2312,7 @@ class ClaudeCodeRunner:
 
             # JSONL からsession_idを取得できなかった場合のフォールバック
             if not session.claude_session_id:
-                if is_resume and task.resume_session:
+                if is_resume and task.resume_session and not is_fork:
                     fallback_path = jsonl_path or _find_jsonl_path_for_session_id(task.resume_session)
                 else:
                     fallback_path = jsonl_path or _find_session_jsonl(cwd, min_ctime=start_time, exclude_paths=_monitored_jsonl_paths)
