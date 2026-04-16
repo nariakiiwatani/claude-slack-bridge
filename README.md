@@ -37,105 +37,44 @@ This tool **remotely operates Claude Code (a CLI capable of shell execution) on 
 
 **Key point:** Uses Socket Mode — no public URL or port forwarding needed.
 
-## Setup
+## Quick Setup
 
-### 1. Create Slack App
+### 1. Create Slack App (using manifest)
 
-1. Go to [Slack API](https://api.slack.com/apps) → **Create New App** → **From scratch**
-2. Choose an app name (e.g. `Claude Code Bridge`) and select your workspace
+1. Go to [Slack API](https://api.slack.com/apps) → **Create New App** → **From an app manifest**
+2. Select your workspace
+3. Paste the contents of [`slack-app-manifest.yml`](slack-app-manifest.yml) (select the YAML tab)
+4. Click **Create**
+5. Copy tokens to `.env` (the install script will prompt you):
+   - **Settings > Basic Information > App-Level Tokens** → Generate (scope: `connections:write`) → `SLACK_APP_TOKEN` (`xapp-...`)
+   - **OAuth & Permissions > Bot User OAuth Token** → `SLACK_BOT_TOKEN` (`xoxb-...`)
 
-#### Enable Socket Mode
-1. Left menu **Socket Mode** → **Enable Socket Mode**
-2. Enter `claude-bridge` as the Token Name → **Generate**
-3. Copy the displayed `xapp-...` token → set it as `SLACK_APP_TOKEN` in `.env`
+> If you prefer to create the app manually, see [Setup Guide](docs/setup-guide.md) for step-by-step instructions.
 
-#### Add Bot Token Scopes
-1. Left menu **OAuth & Permissions** → **Scopes** → **Bot Token Scopes**, add the following:
-   - `chat:write` — Send messages
-   - `channels:history` — Read public channel messages
-   - `groups:history` — Read private channel messages
-   - `files:read` — Read files (for attachment downloads)
-   - `files:write` — Send files (for large results)
-
-#### Configure Event Subscriptions
-1. Left menu **Event Subscriptions** → **Enable Events**
-2. Under **Subscribe to bot events**, add:
-   - `message.channels` — Public channel messages
-   - `message.groups` — Private channel messages
-
-#### Install App
-1. Left menu **Install App** → **Install to Workspace** → Authorize
-2. Copy the **Bot User OAuth Token** (`xoxb-...`) → set it as `SLACK_BOT_TOKEN` in `.env`
-
-### 2. Project Setup
+### 2. Install & Run
 
 ```bash
-cd /path/to/claude-slack-bridge
-
-# Create virtual environment (recommended)
-python3 -m venv venv
-source venv/bin/activate
-
-# Install dependencies
-pip install -r requirements.txt
-
-# Prepare configuration file
-cp .env.example .env
-```
-
-### 3. Configure `.env`
-
-```bash
-# Required
-SLACK_BOT_TOKEN=xoxb-xxxxxxxxxxxx-xxxxxxxxxxxx-xxxxxxxxxxxxxxxxxxxxxxxx
-SLACK_APP_TOKEN=xapp-1-xxxxxxxxxxxx-xxxxxxxxxxxxx-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
-
-# Admin Slack user ID (required)
-# Your profile → … → Copy member ID
-ADMIN_SLACK_USER_ID=U0123456789
-
-# Access control
-SLACK_ALLOWED_USERS=U1111111111,U2222222222   # Specific users only ("*" to allow all)
-SLACK_ALLOWED_CHANNELS=C3333333333             # Specific channels only ("*" to allow all)
-
-# Notification channel (for startup/shutdown notifications, optional)
-# You can specify a user ID (U...) instead of a channel ID to receive DM notifications
-# NOTIFICATION_CHANNEL=C1234567890
-
-# Auto-approved tools (adjust for your project)
-DEFAULT_ALLOWED_TOOLS=Read,Write,Edit,MultiEdit,Bash(git *),TodoWrite
-
-# Claude command path (optional, default: claude)
-# CLAUDE_CMD=claude
-
-# Log level (optional, default: INFO)
-# LOG_LEVEL=INFO
-
-# Language setting (ja / en, default: ja)
-# SLACK_LANGUAGE=ja
-```
-
-**How to find your user ID:** Open your Slack profile → "..." → "Copy member ID"
-
-### 4. Run
-
-Use `scripts/install.sh` for initial setup as a macOS LaunchAgent:
-
-```bash
+git clone https://github.com/nariakiiwatani/claude-slack-bridge.git
+cd claude-slack-bridge
 ./scripts/install.sh
 ```
 
-To restart:
+The install script handles everything:
+- Checks prerequisites (Python 3.10+, Claude CLI)
+- Creates virtual environment and installs dependencies
+- Prompts for Slack tokens and admin user ID → writes `.env`
+- Registers as a macOS LaunchAgent (auto-start on login)
+
+### 3. Service management
 
 ```bash
-launchctl bootout gui/$(id -u)/com.user.claude-slack-bridge
-launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.user.claude-slack-bridge.plist
+./scripts/stop.sh       # Stop
+./scripts/start.sh      # Start
+./scripts/restart.sh    # Restart
+tail -f ~/Library/Logs/claude-slack-bridge/stderr.log  # View logs
 ```
 
-If `NOTIFICATION_CHANNEL` is configured, you'll receive a startup notification in that channel:
-> :rocket: **Claude Code Bridge has started**
-
-> For a detailed step-by-step guide with screenshots, see [Setup Guide](docs/setup-guide.md).
+> For a detailed step-by-step guide, see [Setup Guide](docs/setup-guide.md).
 
 ## Usage
 
@@ -277,49 +216,20 @@ Check the result of npm run build and fix the errors
 
 ## Troubleshooting
 
-### Bridge won't start
-- Verify `SLACK_BOT_TOKEN` and `SLACK_APP_TOKEN` are correct
-- Verify Socket Mode is enabled
-- Verify packages are installed with `pip install -r requirements.txt`
+See [Setup Guide](docs/setup-guide.md#troubleshooting) for detailed troubleshooting steps.
 
-### Bot doesn't respond
-- Verify `SLACK_ALLOWED_USERS` and `SLACK_ALLOWED_CHANNELS` are configured
-- Verify `message.channels` event is subscribed
-- Verify the bot is invited to the channel
-- Verify you're including the `@bot` mention
-- Check the terminal for errors
-
-### Claude Code errors
-- Verify the claude command path with `which claude`
-- Verify `claude -p "hello" --output-format json` works in your terminal
-- Verify Claude Code authentication is valid (try launching `claude` directly)
-
-### Japanese text garbled
-- Try adding `LANG=en_US.UTF-8` to `.env`
-- Verify you're using Python 3.10 or later
+View logs: `tail -f ~/Library/Logs/claude-slack-bridge/stderr.log`
 
 ## Auto-start (macOS)
 
-To start the bridge automatically when your Mac boots, use `scripts/install.sh` which sets up a LaunchAgent (`com.user.claude-slack-bridge`):
+`scripts/install.sh` sets up a LaunchAgent (`com.user.claude-slack-bridge`) that starts automatically on login.
 
 ```bash
-./scripts/install.sh
-```
-
-To manage the service:
-
-```bash
-# Stop
-launchctl bootout gui/$(id -u)/com.user.claude-slack-bridge
-
-# Start
-launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.user.claude-slack-bridge.plist
-
-# Status
-launchctl print gui/$(id -u)/com.user.claude-slack-bridge
-
-# Logs
-tail -f ~/Library/Logs/claude-slack-bridge/stderr.log
+./scripts/stop.sh       # Stop
+./scripts/start.sh      # Start
+./scripts/restart.sh    # Restart
+tail -f ~/Library/Logs/claude-slack-bridge/stderr.log  # Logs
+./scripts/uninstall.sh  # Uninstall
 ```
 
 ---
@@ -352,105 +262,44 @@ Mac上で動くClaude Codeを、Slackから監視・操作するブリッジ。
 
 アーキテクチャ図は[上記の Architecture セクション](#architecture)を参照してください。
 
-### セットアップ
+### クイックセットアップ
 
-#### 1. Slack App を作成
+#### 1. Slack App を作成（manifest使用）
 
-1. [Slack API](https://api.slack.com/apps) にアクセス → **Create New App** → **From scratch**
-2. アプリ名（例: `Claude Code Bridge`）とワークスペースを選択
+1. [Slack API](https://api.slack.com/apps) にアクセス → **Create New App** → **From an app manifest**
+2. ワークスペースを選択
+3. [`slack-app-manifest.yml`](slack-app-manifest.yml) の内容を貼り付け（YAMLタブを選択）
+4. **Create** をクリック
+5. トークンを `.env` にコピー（インストールスクリプトが案内します）:
+   - **Settings > Basic Information > App-Level Tokens** → Generate (scope: `connections:write`) → `SLACK_APP_TOKEN` (`xapp-...`)
+   - **OAuth & Permissions > Bot User OAuth Token** → `SLACK_BOT_TOKEN` (`xoxb-...`)
 
-##### Socket Mode を有効化
-1. 左メニュー **Socket Mode** → **Enable Socket Mode**
-2. Token Name に `claude-bridge` と入力 → **Generate**
-3. 表示される `xapp-...` トークンをコピー → `.env` の `SLACK_APP_TOKEN` に設定
+> 手動でアプリを作成したい場合は [セットアップガイド](docs/setup-guide.md) を参照してください。
 
-##### Bot Token Scopes を追加
-1. 左メニュー **OAuth & Permissions** → **Scopes** → **Bot Token Scopes** に以下を追加:
-   - `chat:write` — メッセージ送信
-   - `channels:history` — パブリックチャンネルのメッセージ読み取り
-   - `groups:history` — プライベートチャンネルのメッセージ読み取り
-   - `files:read` — ファイル読み取り（添付ファイルダウンロード用）
-   - `files:write` — ファイル送信（結果が大きい場合用）
-
-##### Event Subscriptions を設定
-1. 左メニュー **Event Subscriptions** → **Enable Events**
-2. **Subscribe to bot events** に以下を追加:
-   - `message.channels` — パブリックチャンネルのメッセージ
-   - `message.groups` — プライベートチャンネルのメッセージ
-
-##### Install App
-1. 左メニュー **Install App** → **Install to Workspace** → 許可
-2. **Bot User OAuth Token** (`xoxb-...`) をコピー → `.env` の `SLACK_BOT_TOKEN` に設定
-
-#### 2. プロジェクトのセットアップ
+#### 2. インストール＆起動
 
 ```bash
-cd /path/to/claude-slack-bridge
-
-# 仮想環境を作成（推奨）
-python3 -m venv venv
-source venv/bin/activate
-
-# 依存パッケージをインストール
-pip install -r requirements.txt
-
-# 設定ファイルを準備
-cp .env.example .env
-```
-
-#### 3. `.env` を編集
-
-```bash
-# 必須
-SLACK_BOT_TOKEN=xoxb-xxxxxxxxxxxx-xxxxxxxxxxxx-xxxxxxxxxxxxxxxxxxxxxxxx
-SLACK_APP_TOKEN=xapp-1-xxxxxxxxxxxx-xxxxxxxxxxxxx-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
-
-# 管理者のSlackユーザーID（必須）
-# 自分のプロフィール → … → Copy member ID
-ADMIN_SLACK_USER_ID=U0123456789
-
-# アクセス制御
-SLACK_ALLOWED_USERS=U1111111111,U2222222222   # 特定ユーザーのみ（"*" で全許可）
-SLACK_ALLOWED_CHANNELS=C3333333333             # 特定チャンネルのみ（"*" で全許可）
-
-# 通知チャンネル（起動/停止通知の送信先、任意）
-# チャンネルIDの代わりにユーザーID（U...）を指定するとDMで通知されます
-# NOTIFICATION_CHANNEL=C1234567890
-
-# 自動承認ツール（プロジェクトに合わせて調整）
-DEFAULT_ALLOWED_TOOLS=Read,Write,Edit,MultiEdit,Bash(git *),TodoWrite
-
-# claude コマンドのパス（任意、デフォルト: claude）
-# CLAUDE_CMD=claude
-
-# ログレベル（任意、デフォルト: INFO）
-# LOG_LEVEL=INFO
-
-# 言語設定（ja / en、デフォルト: ja）
-# SLACK_LANGUAGE=ja
-```
-
-**ユーザーIDの確認方法:** Slackで自分のプロフィールを開く → 「...」→ 「メンバーIDをコピー」
-
-#### 4. 起動
-
-`scripts/install.sh` でLaunchAgentとしてセットアップします:
-
-```bash
+git clone https://github.com/nariakiiwatani/claude-slack-bridge.git
+cd claude-slack-bridge
 ./scripts/install.sh
 ```
 
-再起動:
+インストールスクリプトがすべて処理します:
+- 前提条件チェック（Python 3.10+、Claude CLI）
+- 仮想環境の作成と依存パッケージのインストール
+- Slackトークンと管理者IDの入力 → `.env` に書き込み
+- macOS LaunchAgentとして登録（ログイン時に自動起動）
+
+#### 3. サービス管理
 
 ```bash
-launchctl bootout gui/$(id -u)/com.user.claude-slack-bridge
-launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.user.claude-slack-bridge.plist
+./scripts/stop.sh       # 停止
+./scripts/start.sh      # 起動
+./scripts/restart.sh    # 再起動
+tail -f ~/Library/Logs/claude-slack-bridge/stderr.log  # ログ確認
 ```
 
-`NOTIFICATION_CHANNEL` を設定している場合、そのチャンネルに起動通知が届きます:
-> :rocket: **Claude Code Bridge が起動しました**
-
-> スクリーンショット付きの詳しい手順は [セットアップガイド](docs/setup-guide.md) を参照してください。
+> 詳しい手順は [セットアップガイド](docs/setup-guide.md) を参照してください。
 
 ### 使い方
 
@@ -593,50 +442,9 @@ npm run build の結果を見てエラーを修正して
 
 ### トラブルシューティング
 
-#### Bridge が起動しない
-- `SLACK_BOT_TOKEN` と `SLACK_APP_TOKEN` が正しいか確認
-- Socket Mode が有効になっているか確認
-- `pip install -r requirements.txt` でパッケージがインストール済みか確認
+問題が発生した場合は [セットアップガイド](docs/setup-guide.md#トラブルシューティング) を参照してください。
 
-#### Bot が反応しない
-- `SLACK_ALLOWED_USERS` と `SLACK_ALLOWED_CHANNELS` が設定されているか確認
-- `message.channels` イベントが購読されているか確認
-- botがチャンネルに招待されているか確認
-- `@bot` メンションを付けているか確認
-- ターミナルにエラーが出ていないか確認
-
-#### Claude Code がエラーになる
-- `which claude` でclaude コマンドのパスを確認
-- ターミナルで `claude -p "hello" --output-format json` が動くか確認
-- Claude Code の認証が有効か確認（`claude` を直接起動して確認）
-
-#### 日本語が文字化けする
-- `.env` に `LANG=en_US.UTF-8` を追加してみる
-- Python 3.10 以上を使用しているか確認
-
-### 自動起動 (macOS)
-
-Mac起動時に自動で立ち上げたい場合、`scripts/install.sh` でLaunchAgent（`com.user.claude-slack-bridge`）をセットアップできます:
-
-```bash
-./scripts/install.sh
-```
-
-サービスの管理:
-
-```bash
-# 停止
-launchctl bootout gui/$(id -u)/com.user.claude-slack-bridge
-
-# 起動
-launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.user.claude-slack-bridge.plist
-
-# 状態確認
-launchctl print gui/$(id -u)/com.user.claude-slack-bridge
-
-# ログ確認
-tail -f ~/Library/Logs/claude-slack-bridge/stderr.log
-```
+ログ確認: `tail -f ~/Library/Logs/claude-slack-bridge/stderr.log`
 
 ## ライセンス / License
 

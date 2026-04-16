@@ -36,6 +36,7 @@ import os
 import pty
 import re
 import select
+import shutil
 import signal
 import struct
 import subprocess
@@ -75,7 +76,58 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# ── 設定 ──────────────────────────────────────────────────
+# ── 設定（バリデーション付き）──────────────────────────────
+def _validate_config():
+    """必須環境変数とコマンドの存在を確認し、問題があればわかりやすいエラーを出す"""
+    errors = []
+
+    # 必須環境変数
+    required_vars = {
+        "SLACK_BOT_TOKEN": "Slack Bot Token (xoxb-...)",
+        "SLACK_APP_TOKEN": "Slack App-Level Token (xapp-...)",
+        "ADMIN_SLACK_USER_ID": "管理者の Slack User ID (U...)",
+    }
+    for var, desc in required_vars.items():
+        val = os.environ.get(var, "")
+        if not val:
+            errors.append(f"  {var} が未設定です — {desc}")
+
+    # トークン形式チェック（設定されている場合のみ）
+    bot_token = os.environ.get("SLACK_BOT_TOKEN", "")
+    if bot_token and not bot_token.startswith("xoxb-"):
+        errors.append(f"  SLACK_BOT_TOKEN が xoxb- で始まっていません (値: {bot_token[:10]}...)")
+
+    app_token = os.environ.get("SLACK_APP_TOKEN", "")
+    if app_token and not app_token.startswith("xapp-"):
+        errors.append(f"  SLACK_APP_TOKEN が xapp- で始まっていません (値: {app_token[:10]}...)")
+
+    admin_id = os.environ.get("ADMIN_SLACK_USER_ID", "")
+    if admin_id and not admin_id.startswith("U"):
+        errors.append(f"  ADMIN_SLACK_USER_ID が U で始まっていません (値: {admin_id})")
+
+    # claude コマンドの存在チェック
+    claude_cmd = os.environ.get("CLAUDE_CMD", "claude")
+    if shutil.which(claude_cmd) is None:
+        errors.append(
+            f"  claude コマンドが見つかりません (CLAUDE_CMD={claude_cmd})\n"
+            f"    → Claude Code CLI をインストールしてください\n"
+            f"    → 別のパスにある場合は .env の CLAUDE_CMD を設定してください"
+        )
+
+    if errors:
+        logger.error("=" * 55)
+        logger.error("  設定エラーが見つかりました:")
+        logger.error("=" * 55)
+        for e in errors:
+            logger.error(e)
+        logger.error("=" * 55)
+        logger.error("  .env ファイルを確認してください")
+        logger.error("  セットアップ: ./scripts/install.sh")
+        logger.error("=" * 55)
+        sys.exit(1)
+
+_validate_config()
+
 SLACK_BOT_TOKEN = os.environ["SLACK_BOT_TOKEN"]
 SLACK_APP_TOKEN = os.environ["SLACK_APP_TOKEN"]
 # 管理者ユーザーID（必須）。アクセス制御に使用。

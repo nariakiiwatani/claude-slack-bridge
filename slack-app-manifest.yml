@@ -1,0 +1,48 @@
+# ============================================
+# Claude Code ⇔ Slack Bridge — App Manifest
+# ============================================
+# このファイルを使って Slack App を一括作成できます。
+#
+# 手順:
+#   1. https://api.slack.com/apps → "Create New App" → "From an app manifest"
+#   2. ワークスペースを選択
+#   3. このファイルの内容を貼り付け (YAML タブを選択)
+#   4. "Create" をクリック
+#   5. 作成後、以下のトークンを .env にコピー:
+#      - Settings > Basic Information > App-Level Tokens → Generate
+#        (scope: connections:write) → SLACK_APP_TOKEN (xapp-...)
+#      - OAuth & Permissions > Bot User OAuth Token → SLACK_BOT_TOKEN (xoxb-...)
+#
+# 注意: App-Level Token は manifest では自動生成されません。
+#       アプリ作成後に手動で生成する必要があります。
+
+display_information:
+  name: Claude Code Bridge
+  description: Control Claude Code (CLI) on your Mac from Slack
+  background_color: "#4A154B"
+
+features:
+  bot_user:
+    display_name: Claude Code
+    always_online: true
+
+oauth_config:
+  scopes:
+    bot:
+      - chat:write
+      - channels:history
+      - groups:history
+      - files:read
+      - files:write
+
+settings:
+  event_subscriptions:
+    bot_events:
+      - message.channels
+      - message.groups
+      - app_mention
+  interactivity:
+    is_enabled: false
+  org_deploy_enabled: false
+  socket_mode_enabled: true
+  token_rotation_enabled: false
