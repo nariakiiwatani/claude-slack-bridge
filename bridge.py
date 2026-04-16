@@ -27,6 +27,7 @@ Mac上で動くClaude CodeをSlackから操作するブリッジ。
   <指示>                    → 同セッションで --resume 続行（タスク待機中はCLIに転送）
 """
 
+import collections
 import fcntl
 import io
 import json
@@ -39,6 +40,7 @@ import signal
 import struct
 import subprocess
 import sys
+import tempfile
 import termios
 import threading
 import time
@@ -58,6 +60,7 @@ try:
     from PIL import Image as PILImage
 except ImportError:
     PILImage = None
+
 
 from slack_bolt import App
 from slack_bolt.adapter.socket_mode import SocketModeHandler
@@ -705,7 +708,88 @@ def _get_process_cwd(pid: int) -> Optional[str]:
 
 
 # ── ターミナル出力モニタリング ─────────────────────────────
-TERMINAL_POLL_INTERVAL = 3.0
+_PERIODIC_CHECK_INTERVAL = 15.0  # プロセス生存・テイクオーバー等の定期チェック間隔（秒）
+
+
+class _JsonlWatcher:
+    """mtimeポーリング + threading.Event でJSONLファイル変更を検知。
+    notify() で外部イベント（Slack入力転送等）を即座に通知でき、
+    ファイル変更は短周期の mtime チェックで検知する。"""
+
+    _POLL_INTERVAL = 1.0  # mtime チェック間隔（秒）
+
+    def __init__(self):
+        self._event = threading.Event()       # monitor thread への通知用
+        self._stop_event = threading.Event()  # ポーリングスレッド停止用
+        self._paths: list[str] = []
+        self._mtimes: dict[str, float] = {}
+        self._thread: Optional[threading.Thread] = None
+
+    def start(self, paths: list[str]):
+        """監視対象パスを設定してポーリングスレッドを開始。"""
+        for p in paths:
+            if p:
+                self._paths.append(p)
+        self._thread = threading.Thread(target=self._poll_loop, daemon=True)
+        self._thread.start()
+
+    def add_path(self, path: str):
+        """監視対象パスを追加。"""
+        if path and path not in self._paths:
+            self._paths.append(path)
+
+    def wait(self, timeout: float) -> bool:
+        """変更イベントまたはnotifyを待つ。変更があればTrue、タイムアウトならFalse。"""
+        result = self._event.wait(timeout=timeout)
+        self._event.clear()
+        return result
+
+    def notify(self):
+        """外部から手動でイベントを発火（入力メッセージ到着時など）。"""
+        self._event.set()
+
+    def stop(self):
+        self._stop_event.set()
+        if self._thread:
+            self._thread.join(timeout=3)
+            self._thread = None
+
+    def _poll_loop(self):
+        """バックグラウンドでmtimeを定期チェックし、変更があればイベントを発火。"""
+        while not self._stop_event.is_set():
+            changed = False
+            for p in list(self._paths):
+                try:
+                    if os.path.isdir(p):
+                        for root, _dirs, files in os.walk(p):
+                            for f in files:
+                                if f.endswith(".jsonl"):
+                                    fp = os.path.join(root, f)
+                                    try:
+                                        mt = os.path.getmtime(fp)
+                                        if fp not in self._mtimes:
+                                            self._mtimes[fp] = mt
+                                            changed = True
+                                        elif mt > self._mtimes[fp]:
+                                            self._mtimes[fp] = mt
+                                            changed = True
+                                    except OSError:
+                                        pass
+                    else:
+                        try:
+                            mt = os.path.getmtime(p)
+                            if p not in self._mtimes:
+                                self._mtimes[p] = mt
+                            elif mt > self._mtimes[p]:
+                                self._mtimes[p] = mt
+                                changed = True
+                        except OSError:
+                            pass
+                except OSError:
+                    pass
+            if changed:
+                self._event.set()
+            self._stop_event.wait(timeout=self._POLL_INTERVAL)
 
 
 def _read_terminal_contents(tty_device: str) -> Optional[str]:
@@ -764,6 +848,13 @@ def _is_process_alive(pid: int) -> bool:
 
 
 # ── セッションJSONL監視 ──────────────────────────────────
+def _cwd_to_project_dir_name(cwd: str) -> str:
+    """CWDをClaude CLIのプロジェクトディレクトリ名に変換。
+    CLIは英数字・ハイフン・ドット以外の文字（/, _, スペース, 日本語等）を
+    すべて '-' に置換する。"""
+    return re.sub(r"[^a-zA-Z0-9\-.]", "-", cwd)
+
+
 def _find_session_jsonl(cwd: str, min_mtime: float = 0, min_ctime: float = 0, exclude_paths: set[str] | None = None) -> Optional[str]:
     """CWDからclaude CLIのセッションJSONLファイルパスを特定。
     JONLファイル内のcwdフィールドで逆引きマッチする。
@@ -774,13 +865,20 @@ def _find_session_jsonl(cwd: str, min_mtime: float = 0, min_ctime: float = 0, ex
     projects_base = Path.home() / ".claude" / "projects"
     if not projects_base.is_dir():
         return None
-    # 全プロジェクトディレクトリ内のjsonlファイルからcwdが一致するものを探す
-    # mtime降順でソートし、exclude_pathsに含まれないものを優先的に採用
+
+    # cwdからプロジェクトディレクトリを特定して検索範囲を絞る
+    proj_dir_name = _cwd_to_project_dir_name(cwd)
+    target_dir = projects_base / proj_dir_name
+    if target_dir.is_dir():
+        proj_dirs = [target_dir]
+    else:
+        # フォールバック: ディレクトリ名変換規則が合わない場合は全スキャン
+        logger.debug("_find_session_jsonl: project dir not found for cwd=%s (expected=%s), falling back to full scan", cwd, proj_dir_name)
+        proj_dirs = [d for d in projects_base.iterdir() if d.is_dir()]
+
     best_path: Optional[str] = None
     best_mtime: float = 0
-    for proj_dir in projects_base.iterdir():
-        if not proj_dir.is_dir():
-            continue
+    for proj_dir in proj_dirs:
         jsonl_files = list(proj_dir.glob("*.jsonl"))
         if not jsonl_files:
             continue
@@ -1073,7 +1171,7 @@ def _read_subagent_jsonl_entries(
 
 
 def _monitor_session_jsonl(inst: dict, thread_ts: str, channel: str, client: WebClient):
-    """セッションJSONLファイルをポーリングし、新しいエントリをSlackに投稿。
+    """セッションJSONLファイルをwatchdogで監視し、新しいエントリをSlackに投稿。
     - thinking/tool_use → 1つのステータスメッセージをchat_updateで更新（:hourglass:付き）
       thinkingが来るたびに表示をリセットし、最新の1セット（thinking+後続tool_use）のみ表示。
       全履歴はall_status_historyに蓄積し、完了時にファイル添付で投稿。
@@ -1121,8 +1219,14 @@ def _monitor_session_jsonl(inst: dict, thread_ts: str, channel: str, client: Web
         except OSError:
             pass
 
+    # watchdog ファイル監視
+    watcher = _JsonlWatcher()
+    watch_paths = [p for p in [jsonl_path, subagents_dir] if p]
+    watcher.start(watch_paths)
+    inst["_watcher"] = watcher  # 外部から notify() するために inst に格納
+
     # プラン承認バッファリング（概要テキストを先に表示するため）
-    pending_plan_approval: list | None = None  # [question_text, metadata, wait_count]
+    pending_plan_approval: list | None = None  # [question_text, metadata, wait_start]
 
     def _extract_task_info(entry: dict):
         """エントリからtask情報（session_id, result, tool_calls）を抽出"""
@@ -1384,18 +1488,18 @@ def _monitor_session_jsonl(inst: dict, thread_ts: str, channel: str, client: Web
             metadata["questions"][0]["is_plan_approval"] = True
         _post_question(question_text, metadata, extra_files=extra_files)
 
-    # 外部テイクオーバー検出用カウンタ（bridge起動タスクのみ）
-    _takeover_poll_count = 0
-    _TAKEOVER_CHECK_INTERVAL = 5  # 5ポール（約15秒）ごとにチェック
+    # 外部テイクオーバー検出用タイマー（bridge起動タスクのみ）
+    _last_takeover_check: float = time.time()
+    _TAKEOVER_CHECK_INTERVAL = 15.0  # 秒
 
     while _is_process_alive(pid):
-        time.sleep(TERMINAL_POLL_INTERVAL)
+        watcher.wait(timeout=_PERIODIC_CHECK_INTERVAL)
 
         # 外部テイクオーバー検出（bridge起動タスクのみ、定期チェック）
+        now = time.time()
         if task_ref and task_ref.process and inst.get("bind_mode") != "live":
-            _takeover_poll_count += 1
-            if _takeover_poll_count >= _TAKEOVER_CHECK_INTERVAL:
-                _takeover_poll_count = 0
+            if (now - _last_takeover_check) >= _TAKEOVER_CHECK_INTERVAL:
+                _last_takeover_check = now
                 session_ref = inst.get("session")
                 if session_ref:
                     external = _detect_external_takeover(inst, session_ref)
@@ -1415,6 +1519,7 @@ def _monitor_session_jsonl(inst: dict, thread_ts: str, channel: str, client: Web
                             _monitored_jsonl_paths.discard(old_jsonl)
                         if jsonl_path:
                             _monitored_jsonl_paths.add(jsonl_path)
+                            watcher.add_path(jsonl_path)
                         # JSONL オフセットをリセット（既存内容はスキップ）
                         try:
                             file_offset = os.path.getsize(jsonl_path)
@@ -1442,6 +1547,7 @@ def _monitor_session_jsonl(inst: dict, thread_ts: str, channel: str, client: Web
                 _finalize_progress()
                 jsonl_path = new_path
                 inst["jsonl_path"] = jsonl_path
+                watcher.add_path(jsonl_path)
                 file_offset = 0
 
         # jsonl_pathがまだ見つかっていない場合はスキップ（bind時にJSONL未発見でも起動可能）
@@ -1452,9 +1558,7 @@ def _monitor_session_jsonl(inst: dict, thread_ts: str, channel: str, client: Web
         if not new_entries:
             # バッファリング中のプラン承認のタイムアウトチェック
             if pending_plan_approval:
-                pending_plan_approval[2] += 1
-                timeout_polls = max(1, int(15 / TERMINAL_POLL_INTERVAL))
-                if pending_plan_approval[2] >= timeout_polls:
+                if (time.time() - pending_plan_approval[2]) >= 15.0:
                     _finalize_progress()
                     _post_plan_approval(pending_plan_approval[0], pending_plan_approval[1])
                     pending_plan_approval = None
@@ -1512,7 +1616,7 @@ def _monitor_session_jsonl(inst: dict, thread_ts: str, channel: str, client: Web
                     _finalize_progress()
                     # プラン承認はバッファリング（概要テキストを先に表示するため）
                     if metadata and metadata.get("plan_content") is not None:
-                        pending_plan_approval = [text, metadata, 0]
+                        pending_plan_approval = [text, metadata, time.time()]
                     else:
                         _post_question(text, metadata)
                     # ステータス内容をリセット（進捗メッセージは同一メッセージを使い続ける）
@@ -1541,10 +1645,8 @@ def _monitor_session_jsonl(inst: dict, thread_ts: str, channel: str, client: Web
                 status_lines = []
                 latest_text = None
             else:
-                pending_plan_approval[2] += 1
                 # タイムアウト: テキストが来なくても投稿（約15秒）
-                timeout_polls = max(1, int(15 / TERMINAL_POLL_INTERVAL))
-                if pending_plan_approval[2] >= timeout_polls:
+                if (time.time() - pending_plan_approval[2]) >= 15.0:
                     _finalize_progress()
                     _post_plan_approval(pending_plan_approval[0], pending_plan_approval[1])
                     pending_plan_approval = None
@@ -1580,7 +1682,7 @@ def _monitor_session_jsonl(inst: dict, thread_ts: str, channel: str, client: Web
                         text_parts = []
                     _finalize_progress()
                     if metadata and metadata.get("plan_content") is not None:
-                        pending_plan_approval = [text, metadata, 0]
+                        pending_plan_approval = [text, metadata, time.time()]
                     else:
                         _post_question(text, metadata)
                     status_msg_ts = None
@@ -1620,6 +1722,10 @@ def _monitor_session_jsonl(inst: dict, thread_ts: str, channel: str, client: Web
 
     # 残った進捗を確定
     _finalize_progress()
+
+    # watchdog 停止
+    watcher.stop()
+    inst.pop("_watcher", None)
 
     # ステータス履歴と進捗メッセージtsをinstに格納（_executeで使用）
     inst["_status_history"] = all_status_history
@@ -1977,8 +2083,15 @@ class ClaudeCodeRunner:
             else:
                 del data[channel_id]
         try:
-            with open(SESSIONS_FILE, "w") as f:
-                json.dump(data, f, ensure_ascii=False, indent=2)
+            dir_name = os.path.dirname(SESSIONS_FILE)
+            fd, tmp_path = tempfile.mkstemp(dir=dir_name, suffix=".tmp")
+            try:
+                with os.fdopen(fd, "w") as f:
+                    json.dump(data, f, ensure_ascii=False, indent=2)
+                os.replace(tmp_path, SESSIONS_FILE)
+            except BaseException:
+                os.unlink(tmp_path)
+                raise
         except Exception as e:
             logger.warning("Failed to save sessions: %s", e)
 
@@ -2822,6 +2935,12 @@ pending_directory_requests: dict[str, dict] = {}
 # シャットダウンイベント（バックグラウンドスレッド停止用）
 _shutdown_event = threading.Event()
 
+# メッセージ重複排除キャッシュ（Socket Mode再接続時の再送対策）
+# イベントの client_msg_id または ts をキーとして保持
+_DEDUP_CACHE_MAX = 500
+_processed_events: collections.OrderedDict[str, None] = collections.OrderedDict()
+_processed_events_lock = threading.Lock()
+
 
 BOT_USER_ID = None
 
@@ -2847,6 +2966,18 @@ def _strip_bot_mention(text: str) -> str:
 
 @app.event("message")
 def handle_message(event, say):
+    # ── メッセージ重複排除（Socket Mode再接続時の再送対策）──
+    dedup_key = event.get("client_msg_id") or event.get("ts", "")
+    if dedup_key:
+        with _processed_events_lock:
+            if dedup_key in _processed_events:
+                logger.info("Duplicate message ignored: key=%s", dedup_key)
+                return
+            _processed_events[dedup_key] = None
+            # キャッシュサイズ制限
+            while len(_processed_events) > _DEDUP_CACHE_MAX:
+                _processed_events.popitem(last=False)
+
     channel_type = event.get("channel_type", "")
     user_id = event.get("user", "")
 
@@ -3361,6 +3492,9 @@ def _handle_instance_input(text: str, say, parent_ts: str, channel_id: str,
             )
             inst["input_msg_ts"] = resp["ts"]
             inst["input_msg_text"] = msg_text
+            w = inst.get("_watcher")
+            if w:
+                w.notify()
             return True
 
         # ── TTYがない場合のエラー ──
@@ -3447,6 +3581,9 @@ def _handle_instance_input(text: str, say, parent_ts: str, channel_id: str,
             )
             inst["input_msg_ts"] = resp["ts"]
             inst["input_msg_text"] = msg_text
+            w = inst.get("_watcher")
+            if w:
+                w.notify()
         else:
             say(text=t("error_input_send_failed", error=result.stderr.strip()), thread_ts=parent_ts)
     except OSError as e:
