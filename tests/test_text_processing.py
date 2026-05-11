@@ -1,116 +1,10 @@
 """テキスト処理関数のテスト。
 
-対象: _md_to_slack, _strip_ansi,
-      _augment_prompt_with_files, _strip_bot_mention, _summarize_input
+対象: _strip_ansi, _augment_prompt_with_files,
+      _strip_bot_mention, _summarize_input
 """
 
 import bridge
-
-ZWS = "\u200B"  # ゼロ幅スペース（_md_to_slack 出力で使用）
-
-
-# ── _md_to_slack ──────────────────────────────────────────
-
-class TestMdToSlack:
-    """Markdown → Slack mrkdwn 変換"""
-
-    def test_bold(self):
-        result = bridge._md_to_slack("**text**")
-        assert f"{ZWS}*text*{ZWS}" in result
-
-    def test_italic(self):
-        result = bridge._md_to_slack("*text*")
-        assert f"{ZWS}_text_{ZWS}" in result
-
-    def test_bold_italic(self):
-        result = bridge._md_to_slack("***text***")
-        assert f"{ZWS}*_text_*{ZWS}" in result
-
-    def test_strikethrough(self):
-        result = bridge._md_to_slack("~~text~~")
-        assert f"{ZWS}~text~{ZWS}" in result
-
-    def test_code_block_preserved(self):
-        md = "```python\nprint('hello')\n```"
-        result = bridge._md_to_slack(md)
-        assert "```\nprint('hello')\n```" in result
-
-    def test_code_block_language_stripped(self):
-        md = "```javascript\nconsole.log('hi')\n```"
-        result = bridge._md_to_slack(md)
-        # 言語指定が除去されていること
-        assert "```javascript" not in result
-        assert "```\nconsole.log('hi')\n```" in result
-
-    def test_inline_code_preserved(self):
-        result = bridge._md_to_slack("use `foo()` here")
-        assert "`foo()`" in result
-
-    def test_table_to_code_block(self):
-        md = "| col1 | col2 |\n| --- | --- |\n| a | b |"
-        result = bridge._md_to_slack(md)
-        assert result.startswith("```\n")
-        assert "| col1 | col2 |" in result
-
-    def test_link(self):
-        result = bridge._md_to_slack("[click](https://example.com)")
-        assert "<https://example.com|click>" in result
-
-    def test_header(self):
-        result = bridge._md_to_slack("# Header")
-        assert "*Header*" in result
-
-    def test_header_h2(self):
-        result = bridge._md_to_slack("## Sub Header")
-        assert "*Sub Header*" in result
-
-    def test_unordered_list(self):
-        result = bridge._md_to_slack("- item one\n- item two")
-        assert "\u2022 item one" in result
-        assert "\u2022 item two" in result
-
-    def test_horizontal_rule(self):
-        result = bridge._md_to_slack("---")
-        assert "\u2501" in result  # ━ 文字
-
-    def test_horizontal_rule_asterisks(self):
-        result = bridge._md_to_slack("***")
-        # *** は bold italic ではなく、行全体がマッチする場合は水平線
-        # ただし *** は bold-italic の空マッチとして扱われうるのでどちらかを確認
-        # 実際の挙動: ***は行頭の --- 等と同じパターン
-        assert "\u2501" in result or "*" in result
-
-    def test_underscore_bold(self):
-        result = bridge._md_to_slack("__bold__")
-        assert f"{ZWS}*bold*{ZWS}" in result
-
-    def test_nested_quote_flattened(self):
-        result = bridge._md_to_slack(">> nested quote")
-        assert result.startswith("> ")
-        assert ">>" not in result
-
-    def test_task_list_checked(self):
-        result = bridge._md_to_slack("- [x] done")
-        assert "\u2705" in result  # ✅
-
-    def test_task_list_unchecked(self):
-        result = bridge._md_to_slack("- [ ] todo")
-        assert "\u2610" in result  # ☐
-
-    def test_plain_text_unchanged(self):
-        result = bridge._md_to_slack("just plain text")
-        assert result == "just plain text"
-
-    def test_inline_code_not_formatted(self):
-        """インラインコード内部のマークダウンは変換されない"""
-        result = bridge._md_to_slack("`**not bold**`")
-        assert "`**not bold**`" in result
-
-    def test_code_block_content_not_formatted(self):
-        """コードブロック内部のマークダウンは変換されない"""
-        md = "```\n**not bold**\n```"
-        result = bridge._md_to_slack(md)
-        assert "**not bold**" in result
 
 
 # ── _strip_ansi ───────────────────────────────────────────
@@ -175,7 +69,7 @@ class TestAugmentPromptWithFiles:
         assert result.startswith("describe")
         assert "/tmp/a.png" in result
         assert "/tmp/b.jpg" in result
-        assert "\u6dfb\u4ed8\u30d5\u30a1\u30a4\u30eb:" in result  # 「添付ファイル:」
+        assert "添付ファイル:" in result  # 「添付ファイル:」
 
     def test_single_file(self):
         result = bridge._augment_prompt_with_files("hello", ["/img.png"])

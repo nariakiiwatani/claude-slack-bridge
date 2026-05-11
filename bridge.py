@@ -425,91 +425,6 @@ def _augment_prompt_with_files(prompt: str, file_paths: list[str]) -> str:
     return f"{prompt}\n\n{t('prompt_attached_files')}\n{lines}"
 
 
-# ---------------------------------------------------------------------------
-# Markdown → Slack mrkdwn 変換
-# ---------------------------------------------------------------------------
-# Claude CLI は標準 Markdown で出力するが、Slack の mrkdwn は異なる記法を使う。
-#   **bold** → *bold*,  ***bold italic*** → *_text_*,
-#   *italic* → _italic_,  ~~strike~~ → ~strike~,
-#   # Header → *Header*,  [text](url) → <url|text>,
-#   - item → • item,  table → code block,  --- → ━━━
-# コードブロック / インラインコード内部は変換しない。
-# CJK文字隣接時にゼロ幅スペース(U+200B)を挿入してSlackの書式レンダリングを保証。
-
-def _md_to_slack(text: str) -> str:
-    """標準 Markdown テキストを Slack mrkdwn 形式に変換する。"""
-    _placeholders: list[str] = []
-    ZWS = "​"  # ゼロ幅スペース: Slack mrkdwn の書式境界を確保
-
-    def _ph(content: str) -> str:
-        """テキストをプレースホルダーに退避"""
-        _placeholders.append(content)
-        return f"\x00CB{len(_placeholders) - 1}\x00"
-
-    def _save(replacement: str):
-        """変換済みテキストをZWS付きプレースホルダーに退避して返す"""
-        def _inner(m: re.Match) -> str:
-            converted = replacement.replace(r"\1", m.group(1))
-            return _ph(f"{ZWS}{converted}{ZWS}")
-        return _inner
-
-    def _save_raw(m: re.Match) -> str:
-        """マッチしたテキストをそのまま退避（コードブロック用）"""
-        code = m.group(0)
-        # コードブロックの言語指定を除去（Slack では表示されるだけで意味がない）
-        if code.startswith("```"):
-            code = re.sub(r"^```\w*", "```", code)
-        return _ph(code)
-
-    # コードブロック (```...```) → 退避
-    text = re.sub(r"```[\s\S]*?```", _save_raw, text)
-    # インラインコード (`...`) → 退避
-    text = re.sub(r"`[^`\n]+`", _save_raw, text)
-
-    # Markdown テーブル（|で始まる連続行、2行以上）→ コードブロック化して退避
-    text = re.sub(
-        r"(?:^[ \t]*\|[^\n]*\|[ \t]*$\n?){2,}",
-        lambda m: _ph(f"```\n{m.group(0).rstrip()}\n```"),
-        text, flags=re.MULTILINE,
-    )
-
-    # 水平線（行全体が --- / *** / ___ 等）→ 区切り線
-    text = re.sub(r"^[ \t]*([-*_])\1{2,}[ \t]*$", "━━━━━━━━━━━━━━━━━━━━", text, flags=re.MULTILINE)
-
-    # ブロック引用: ネストされた引用 (>>, > >, ...) → 単一レベルに平坦化 (Slackは1レベルのみ)
-    text = re.sub(r"^(?:>[ \t]*){2,}", "> ", text, flags=re.MULTILINE)
-
-    # 順序なしリスト: 行頭の - / * / + → •（太字/イタリック変換前に実行）
-    text = re.sub(r"^([ \t]*)[-*+] ", r"\1• ", text, flags=re.MULTILINE)
-
-    # タスクリスト: [x]/[X] → ✅, [ ]/[] → ☐ (コードブロック退避済みなので安全)
-    text = re.sub(r"\[([xX])\]", "✅", text)
-    text = re.sub(r"\[ ?\]", "☐", text)
-
-    # --- インライン書式変換 ---
-    # ***bold italic*** → *_text_*
-    text = re.sub(r"\*\*\*(.+?)\*\*\*", _save(r"*_\1_*"), text)
-    # **bold** / __bold__ → *bold*（退避して italic 誤変換を防止）
-    text = re.sub(r"\*\*(.+?)\*\*", _save(r"*\1*"), text)
-    text = re.sub(r"__(.+?)__", _save(r"*\1*"), text)
-    # *italic* → _italic_（ZWS付き）
-    text = re.sub(r"(?<!\*)\*(?!\*)(.+?)(?<!\*)\*(?!\*)",
-                  lambda m: f"{ZWS}_{m.group(1)}_{ZWS}", text)
-    # ~~strikethrough~~ → ~strikethrough~（ZWS付き）
-    text = re.sub(r"~~(.+?)~~",
-                  lambda m: f"{ZWS}~{m.group(1)}~{ZWS}", text)
-    # [text](url) → <url|text>
-    text = re.sub(r"\[([^\]]+)\]\(([^)]+)\)", r"<\2|\1>", text)
-    # # Header → *Header*（行頭の # を太字に変換）
-    text = re.sub(r"^#{1,6}\s+(.+)$", r"*\1*", text, flags=re.MULTILINE)
-
-    # プレースホルダー復元（逆順: テーブル内のインラインコード等、ネストを正しく展開）
-    for i in range(len(_placeholders) - 1, -1, -1):
-        text = text.replace(f"\x00CB{i}\x00", _placeholders[i])
-
-    return text
-
-
 def _is_user_allowed(user_id: str) -> bool:
     """ユーザーが操作を許可されているか（チャンネルモード用）"""
     if user_id == ADMIN_SLACK_USER_ID:
@@ -1380,7 +1295,9 @@ def _monitor_session_jsonl(inst: dict, thread_ts: str, channel: str, client: Web
 
     def _flush_progress(final: bool = False):
         """進捗メッセージを更新（テキスト応答 + ステータス行を1メッセージに統合）。
-        final=Trueで⏳を除去。"""
+        Claudeのテキスト応答は markdown ブロック（表/リスト/コードが標準Markdownで描画）、
+        ステータス行 + 実行中サフィックスは section/mrkdwn ブロックで投稿。
+        final=Trueで⏳除去。"""
         nonlocal status_msg_ts
         if not status_lines and not latest_text:
             return
@@ -1400,55 +1317,59 @@ def _monitor_session_jsonl(inst: dict, thread_ts: str, channel: str, client: Web
             if idle_secs >= 10:
                 idle_str = f"{int(idle_secs)}s" if idle_secs < 60 else f"{int(idle_secs // 60)}m{int(idle_secs % 60):02d}s"
                 progress_extra += f"  |  {t('status_last_update', idle=idle_str)}"
-            suffix = "\n" + t("status_running") + progress_extra
-        available = MAX_SLACK_MSG_LENGTH - len(suffix)
-        parts = []
+            suffix = t("status_running") + progress_extra
+
+        blocks: list[dict] = []
+        fallback_parts: list[str] = []
+
+        # Claudeのテキスト応答: markdownブロック（1ペイロード合計12,000文字制限。margin入れて11,000で切り詰め）
         if latest_text:
-            display = _md_to_slack(latest_text)
-            # テキスト部分が長すぎる場合は切り詰め
-            max_text = available // 2
-            if len(display) > max_text:
-                display = display[:max_text] + "\n" + t("status_continued")
-            parts.append(f":speech_balloon: {display_prefix}\n{display}")
-        if status_lines:
-            status_text = _collapse_status_lines(status_lines)
-            # ステータス部分が長すぎる場合は切り詰め
-            max_status = available // 2
-            if len(status_text) > max_status:
-                status_text = status_text[:max_status] + "\n..."
-            parts.append(status_text)
-        text = "\n\n".join(parts)
-        if len(text) > available:
-            text = "...\n" + text[-(available - 4):]
-        text += suffix
-        # JSONエンコーディングのエスケープ分を考慮したサイズチェック
-        # Slack APIはJSONペイロード全体で約40,000文字制限
-        # \n, \r, \t, \\, " はJSONエスケープで各1文字増加する
-        json_overhead = text.count('\n') + text.count('\r') + text.count('\t') + text.count('\\') + text.count('"')
-        json_limit = MAX_SLACK_MSG_LENGTH - 200  # JSONペイロードの構造分マージン
-        if len(text) + json_overhead > json_limit:
-            excess = len(text) + json_overhead - json_limit + 100
-            text = text[:len(text) - excess]
-            text = text.rsplit("\n", 1)[0] + "\n..."
+            md_text = latest_text
+            if len(md_text) > 11000:
+                md_text = md_text[:11000] + "\n" + t("status_continued")
+            blocks.append({
+                "type": "markdown",
+                "text": f":speech_balloon: **{display_prefix}**\n\n{md_text}",
+            })
+            fallback_parts.append(f":speech_balloon: {display_prefix}\n{md_text[:300]}")
+
+        # ステータス行 + 実行中サフィックス: section/mrkdwn（1ブロック3,000文字制限）
+        status_text = _collapse_status_lines(status_lines) if status_lines else ""
+        max_status = max(500, 2800 - len(suffix))
+        if len(status_text) > max_status:
+            status_text = status_text[:max_status] + "\n..."
+        combined = f"{status_text}\n{suffix}" if status_text and suffix else (status_text or suffix)
+        if combined:
+            blocks.append({
+                "type": "section",
+                "text": {"type": "mrkdwn", "text": combined},
+            })
+            fallback_parts.append(combined)
+
+        fallback_text = "\n\n".join(fallback_parts)
+        if len(fallback_text) > 3000:
+            fallback_text = fallback_text[:3000] + "\n..."
         try:
             if status_msg_ts:
                 client.chat_update(
-                    channel=channel, ts=status_msg_ts, text=text,
+                    channel=channel, ts=status_msg_ts,
+                    text=fallback_text, blocks=blocks,
                 )
             else:
                 resp = client.chat_postMessage(
-                    channel=channel, thread_ts=thread_ts, text=text,
+                    channel=channel, thread_ts=thread_ts,
+                    text=fallback_text, blocks=blocks,
                 )
                 status_msg_ts = resp["ts"]
         except Exception as e:
-            # msg_too_longエラー時は積極的に切り詰めてリトライ
-            if "msg_too_long" in str(e) and len(text) > 2000:
-                text = text[:2000] + "\n..."
+            # msg_too_longエラー時は積極的に切り詰めてリトライ（blocksは除去）
+            if "msg_too_long" in str(e) and len(fallback_text) > 2000:
+                fallback_text = fallback_text[:2000] + "\n..."
                 try:
                     if status_msg_ts:
-                        client.chat_update(channel=channel, ts=status_msg_ts, text=text)
+                        client.chat_update(channel=channel, ts=status_msg_ts, text=fallback_text, blocks=[])
                     else:
-                        resp = client.chat_postMessage(channel=channel, thread_ts=thread_ts, text=text)
+                        resp = client.chat_postMessage(channel=channel, thread_ts=thread_ts, text=fallback_text, blocks=[])
                         status_msg_ts = resp["ts"]
                 except Exception as e2:
                     logger.error("JSONL progress update retry error PID %d: %s", pid, e2)
@@ -2502,11 +2423,11 @@ class ClaudeCodeRunner:
                 task.status = TaskStatus.COMPLETED
                 task.completed_at = datetime.now()
                 elapsed = (task.completed_at - task.started_at).total_seconds()
-                summary, full_result = self._format_result(
+                fallback_text, blocks, full_result = self._format_result(
                     task, session, elapsed, show_result=True
                 )
-                self._post_completion(session, task, summary, inst,
-                                      full_result=full_result)
+                self._post_completion(session, task, fallback_text, inst,
+                                      full_result=full_result, blocks=blocks)
             else:
                 stderr_raw = proc.stderr.read() if proc.stderr else ""
                 stderr_output = stderr_raw.decode("utf-8", errors="replace") if isinstance(stderr_raw, bytes) else stderr_raw
@@ -2556,19 +2477,21 @@ class ClaudeCodeRunner:
                 instance_threads.pop(registered_thread_ts, None)
 
     def _format_result(self, task: Task, session: Session, elapsed: float,
-                       show_result: bool = True) -> tuple[str, str | None]:
-        """タスク完了メッセージを生成。(summary, full_result_or_none) を返す。
+                       show_result: bool = True) -> tuple[str, list[dict], str | None]:
+        """タスク完了メッセージを生成。(fallback_text, blocks, full_result_or_none) を返す。
+        blocks: section/mrkdwn(ヘッダー) + markdown(本文) + section/mrkdwn(フッター) の構成。
+        Claudeの応答本文は markdown ブロックで投稿し、表/リスト/コードが標準Markdownで描画される。
         full_result_or_none はメッセージに収まらない場合のみ非Noneでファイルアップロード用。"""
         cwd = session.working_dir or "(unknown)"
         dir_name = os.path.basename(cwd)
         display_label = f"{session.label_emoji} {task.short_id}"
         user_info = f"  <@{task.user_id}>" if task.user_id else ""
-        parts = [f"{display_label}  {t('task_complete', elapsed=elapsed)}  :file_folder: `{dir_name}`{user_info}"]
+        header_lines = [f"{display_label}  {t('task_complete', elapsed=elapsed)}  :file_folder: `{dir_name}`{user_info}"]
         if task.tool_calls:
             tools_summary = ", ".join(f"`{tc['name']}`" for tc in task.tool_calls[:10])
             if len(task.tool_calls) > 10:
                 tools_summary += t("task_tools_more", count=len(task.tool_calls) - 10)
-            parts.append(t("task_tools_used", count=len(task.tool_calls), tools=tools_summary))
+            header_lines.append(t("task_tools_used", count=len(task.tool_calls), tools=tools_summary))
         # トークン使用量・コスト表示
         if task.input_tokens > 0 or task.output_tokens > 0:
             def _fmt_tokens(n: int) -> str:
@@ -2589,24 +2512,41 @@ class ClaudeCodeRunner:
                 + task.cache_creation_tokens * 3.75 / 1_000_000
             )
             token_line += "  " + t("task_cost_estimate", cost=cost)
-            parts.append(token_line)
+            header_lines.append(token_line)
+        header_text = "\n".join(header_lines)
+
         full_result = None
+        result_md: str | None = None
         if show_result and task.result:
-            result_text = _md_to_slack(task.result)
-            # ヘッダー部分の長さを考慮して、全体がMAX_SLACK_MSG_LENGTHに収まるか判定
-            header_len = sum(len(p) for p in parts) + 10  # 改行等のマージン
-            available = MAX_SLACK_MSG_LENGTH - header_len
-            if len(result_text) <= available and len(result_text.encode("utf-8")) <= available:
-                parts.append(f"\n{result_text}")
+            # markdownブロック上限 12,000文字。margin入れて11,000を超えたらプレビュー + ファイル添付。
+            if len(task.result) <= 11000:
+                result_md = task.result
             else:
-                # メッセージには先頭のみ、全文はファイルアップロード
-                preview = result_text[:500] + t("task_see_full_file")
-                parts.append(f"\n{preview}")
+                result_md = task.result[:10000] + t("task_see_full_file")
                 full_result = task.result
+
+        footer_lines: list[str] = []
         if session.claude_session_id:
-            parts.append(f"\n_Session: `{session.claude_session_id[:12]}...`_")
-            parts.append(t("task_reply_to_continue"))
-        return "\n".join(parts), full_result
+            footer_lines.append(f"_Session: `{session.claude_session_id[:12]}...`_")
+            footer_lines.append(t("task_reply_to_continue"))
+        footer_text = "\n".join(footer_lines)
+
+        blocks: list[dict] = [
+            {"type": "section", "text": {"type": "mrkdwn", "text": header_text}},
+        ]
+        if result_md:
+            blocks.append({"type": "markdown", "text": result_md})
+        if footer_text:
+            blocks.append({"type": "section", "text": {"type": "mrkdwn", "text": footer_text}})
+
+        fallback_parts = [header_text]
+        if result_md:
+            fallback_parts.append(result_md[:300])
+        if footer_text:
+            fallback_parts.append(footer_text)
+        fallback_text = "\n".join(fallback_parts)
+
+        return fallback_text, blocks, full_result
 
     def assign_task_id(self, task: Task):
         """タスクIDを事前に割り当て（run_task前に呼び出し可能）"""
@@ -2703,8 +2643,11 @@ class ClaudeCodeRunner:
 
     def _post_completion(self, session: Session, task: Task,
                          text: str, inst: dict | None,
-                         *, full_result: str | None = None):
-        """完了メッセージ: ライフサイクルメッセージを削除 + 新規メッセージ投稿 + 添付ファイル送信"""
+                         *, full_result: str | None = None,
+                         blocks: list[dict] | None = None):
+        """完了メッセージ: ライフサイクルメッセージを削除 + 新規メッセージ投稿 + 添付ファイル送信。
+        blocks 指定時は chat_postMessage で本文を blocks 形式で投稿し、ファイルは別投稿で添付する
+        （files_upload_v2 の initial_comment は blocks 非対応のため2リクエストに分割）。"""
         # ライフサイクルメッセージを削除（完了メッセージで置き換えるため）
         if task.lifecycle_msg_ts:
             try:
@@ -2739,6 +2682,33 @@ class ClaudeCodeRunner:
                 "filename": f"changes_{task.short_id}.diff",
                 "title": "Changes",
             })
+
+        if blocks:
+            # blocks付き: 本文を chat_postMessage で投稿、添付ファイルは別投稿
+            try:
+                self.client.chat_postMessage(
+                    channel=session.channel_id,
+                    thread_ts=session.thread_ts or None,
+                    text=text,
+                    blocks=blocks,
+                )
+            except Exception as e:
+                logger.error("Completion blocks post error: %s", e)
+                self._post_to_session(session, text)
+            if file_uploads:
+                try:
+                    self.client.files_upload_v2(
+                        channel=session.channel_id,
+                        thread_ts=session.thread_ts or None,
+                        file_uploads=file_uploads,
+                    )
+                except Exception as e:
+                    logger.error("Completion file upload error: %s", e)
+            if task.result and task.status == TaskStatus.COMPLETED:
+                self._check_tool_request(session, task)
+            return
+
+        # blocks 未指定（エラー系等）: 従来通り initial_comment + ファイル添付
         if file_uploads:
             try:
                 self.client.files_upload_v2(
