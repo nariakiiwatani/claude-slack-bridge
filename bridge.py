@@ -439,7 +439,7 @@ def _augment_prompt_with_files(prompt: str, file_paths: list[str]) -> str:
 def _md_to_slack(text: str) -> str:
     """標準 Markdown テキストを Slack mrkdwn 形式に変換する。"""
     _placeholders: list[str] = []
-    ZWS = "\u200B"  # ゼロ幅スペース: Slack mrkdwn の書式境界を確保
+    ZWS = "​"  # ゼロ幅スペース: Slack mrkdwn の書式境界を確保
 
     def _ph(content: str) -> str:
         """テキストをプレースホルダーに退避"""
@@ -5236,10 +5236,13 @@ def main():
     _SM_BACKOFF_FACTOR = 2.0        # 倍率
     _SM_MAX_RETRIES = 10            # この回数を超えたら終了
     _SM_RESET_AFTER = 120.0         # エラーなしでこの秒数経過したらカウンタリセット
+    _SM_DISCONNECT_NOTIFY_AFTER = 10.0  # 切断がこの秒数継続したらmacOS通知
     _sm_consecutive_errors = 0
     _sm_last_error_time: float = 0.0
     _sm_disconnect_since: float = 0.0   # 切断開始時刻 (0 = 切断中でない)
     _sm_reconnecting = False            # バックオフ再接続処理中フラグ
+    _sm_disconnect_notify_timer: Optional[threading.Timer] = None  # 切断通知の遅延タイマー
+    _sm_disconnect_notified = False     # 切断通知済みフラグ（通知済みの場合のみ復帰通知を出す）
 
     def _macos_notify(title: str, message: str):
         """macOS 通知センターに通知を表示する"""
@@ -5259,32 +5262,42 @@ def main():
             return f"{minutes}分{secs}秒"
         return f"{secs}秒"
 
-    def _notify_reconnected():
-        """接続回復時の通知（Slack + macOS）"""
+    def _fire_disconnect_notification():
+        """切断が _SM_DISCONNECT_NOTIFY_AFTER 秒以上継続した際のmacOS通知"""
+        nonlocal _sm_disconnect_notified
+        if _sm_disconnect_since == 0.0:
+            return
         elapsed = int(time.time() - _sm_disconnect_since)
+        _sm_disconnect_notified = True
+        _macos_notify(
+            "Claude Slack Bridge",
+            f"Slack接続が切断しました（{_format_duration(elapsed)}以上）",
+        )
+
+    def _notify_reconnected():
+        """接続回復時のmacOS通知（切断通知済みの場合のみ）"""
+        nonlocal _sm_disconnect_notify_timer, _sm_disconnect_notified
+        elapsed = int(time.time() - _sm_disconnect_since) if _sm_disconnect_since else 0
         logger.info(
             "Socket Mode 接続回復（%d回リトライ、切断時間 %d秒）",
             _sm_consecutive_errors, elapsed,
         )
-        if NOTIFICATION_CHANNEL:
-            try:
-                slack_client.chat_postMessage(
-                    channel=NOTIFICATION_CHANNEL,
-                    text=t("notify_reconnected",
-                           retries=_sm_consecutive_errors,
-                           duration=_format_duration(elapsed)),
-                )
-            except Exception as e:
-                logger.warning("復旧通知の送信に失敗: %s", e)
-        _macos_notify(
-            "Claude Slack Bridge",
-            f"Slack接続が回復しました（切断 {_format_duration(elapsed)}）",
-        )
+        # 待機中の切断通知タイマーをキャンセル
+        if _sm_disconnect_notify_timer is not None:
+            _sm_disconnect_notify_timer.cancel()
+            _sm_disconnect_notify_timer = None
+        # 切断通知を出した場合のみ復帰通知を出す
+        if _sm_disconnect_notified:
+            _macos_notify(
+                "Claude Slack Bridge",
+                f"Slack接続が回復しました（切断 {_format_duration(elapsed)}）",
+            )
+        _sm_disconnect_notified = False
 
     def _on_socket_error(error: Exception):
         """エラー発生時: SDKの自動再接続を無効にし、バックオフ付き再接続スレッドを起動"""
         nonlocal _sm_consecutive_errors, _sm_last_error_time, _sm_disconnect_since
-        nonlocal _sm_reconnecting
+        nonlocal _sm_reconnecting, _sm_disconnect_notify_timer
         now = time.time()
 
         # 前回エラーから十分時間が経過していればカウンタリセット
@@ -5305,17 +5318,18 @@ def main():
             _sm_consecutive_errors, error,
         )
 
-        # 初回切断時にmacOS通知
-        if _sm_consecutive_errors == 1:
-            _macos_notify(
-                "Claude Slack Bridge",
-                "Slack接続が切れました。自動再接続を試行中…",
+        # 初回エラー時: 10秒後に切断通知を出すタイマーを起動
+        # （10秒以内に復帰すればタイマーはキャンセルされ通知は出ない）
+        if _sm_disconnect_notify_timer is None and not _sm_disconnect_notified:
+            _sm_disconnect_notify_timer = threading.Timer(
+                _SM_DISCONNECT_NOTIFY_AFTER, _fire_disconnect_notification,
             )
+            _sm_disconnect_notify_timer.daemon = True
+            _sm_disconnect_notify_timer.start()
 
         # バックオフ再接続スレッドが未起動なら起動
         if not _sm_reconnecting:
             _sm_reconnecting = True
-            import threading
             threading.Thread(
                 target=_backoff_reconnect_loop,
                 name="sm-backoff-reconnect",
