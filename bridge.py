@@ -5343,16 +5343,21 @@ def main():
 
                 try:
                     handler.client.connect_to_new_endpoint()
-                    # 成功 → 自動再接続を再有効化してカウンタリセット
-                    handler.client.auto_reconnect_enabled = (
-                        handler.client.default_auto_reconnect_enabled
+                    # ハンドシェイクは成功したが、新しい接続から実際に
+                    # メッセージが流れるかはまだ未確認。
+                    # 蓋閉じスリープ復帰直後など「接続は張れるが pong 送信時に
+                    # 即 BrokenPipe で切れる」ケースで、カウンタを 0 リセットすると
+                    # _SM_MAX_RETRIES に永遠に到達できず無限ループに陥るため、
+                    # ここではカウンタを操作しない。
+                    # 実カウンタリセットは _on_message_received（Slack の hello 等
+                    # 実メッセージ受信）でのみ行う。
+                    # 注: SDK の connect_to_new_endpoint() は内部で
+                    # auto_reconnect_enabled を default_auto_reconnect_enabled に
+                    # 戻すので、こちらで再有効化する必要はない。
+                    logger.info(
+                        "Socket Mode 再接続: 新エンドポイント接続成功"
+                        "（実メッセージ受信待ち）"
                     )
-                    if _sm_disconnect_since > 0:
-                        _notify_reconnected()
-                    _sm_consecutive_errors = 0
-                    _sm_last_error_time = 0.0
-                    _sm_disconnect_since = 0.0
-                    logger.info("Socket Mode 再接続成功")
                     break
                 except Exception as e:
                     _sm_consecutive_errors += 1
@@ -5365,12 +5370,16 @@ def main():
             _sm_reconnecting = False
 
     def _on_message_received(client, message, raw_message):
-        """メッセージ受信成功 → エラーカウンタをリセット"""
-        nonlocal _sm_consecutive_errors, _sm_last_error_time, _sm_disconnect_since
+        """メッセージ受信成功 → 切断通知状態をリセット"""
+        nonlocal _sm_disconnect_since
+        # NOTE: _sm_consecutive_errors と _sm_last_error_time はここではリセットしない。
+        # 蓋閉じスリープ復帰直後の「Slack が hello を一発配信した直後に WS が
+        # 即 BrokenPipe で切れる」パターンでは、hello 受信ごとに
+        # _sm_consecutive_errors が 0 にリセットされてしまうと _SM_MAX_RETRIES に
+        # 永遠に到達できず無限ループに陥る。カウンタリセットは _on_socket_error 内の
+        # 時間ベースのチェック（>_SM_RESET_AFTER 秒の無エラー）でのみ行う。
         if _sm_consecutive_errors > 0 and _sm_disconnect_since > 0:
             _notify_reconnected()
-        _sm_consecutive_errors = 0
-        _sm_last_error_time = 0.0
         _sm_disconnect_since = 0.0
 
     handler.client.on_error_listeners.append(_on_socket_error)
