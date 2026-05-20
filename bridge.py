@@ -5202,10 +5202,13 @@ def main():
     # バックオフしながら自前で再接続を試みる。
     # 最大リトライ回数を超えたらプロセスを終了し、launchctlに再起動させる。
     _SM_BACKOFF_INITIAL = 2.0       # 初回待機秒数
-    _SM_BACKOFF_MAX = 120.0         # 最大待機秒数
+    _SM_BACKOFF_MAX = 60.0          # 最大待機秒数
     _SM_BACKOFF_FACTOR = 2.0        # 倍率
     _SM_MAX_RETRIES = 10            # この回数を超えたら終了
-    _SM_RESET_AFTER = 120.0         # エラーなしでこの秒数経過したらカウンタリセット
+    # _SM_BACKOFF_MAX より十分大きい値にする。等しいと
+    # 「バックオフ最大値で待機→新エラー→経過 > RESET_AFTER でリセット」
+    # の経路でカウンタが永遠に MAX_RETRIES に届かない無限ループに陥る。
+    _SM_RESET_AFTER = 600.0         # エラーなしでこの秒数経過したらカウンタリセット
     _SM_DISCONNECT_NOTIFY_AFTER = 10.0  # 切断がこの秒数継続したらmacOS通知
     _sm_consecutive_errors = 0
     _sm_last_error_time: float = 0.0
