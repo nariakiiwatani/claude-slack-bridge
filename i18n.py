@@ -58,6 +58,12 @@ MESSAGES: dict[str, dict[str, str]] = {
         "task_complete": ":white_check_mark: *タスク完了* ({elapsed:.0f}秒)",
         "task_cancelled": ":stop_sign: キャンセルされました",
         "task_failed": ":x: 失敗 (exit {code})",
+        "task_interrupted_by_restart": (
+            ":electric_plug: {label}  ネットワーク切断などで bridge が再起動され、"
+            "このタスクは中断されました。\n"
+            "_直前の指示_: {prompt}\n"
+            "このスレッドに返信すると `--resume` で続きから再開します。"
+        ),
         "task_error": ":x: エラー: {error}",
         "task_last_action": ":rewind: 最後の操作: `{tool}` {summary}",
         "task_tools_used": "使用ツール ({count}回): {tools}",
@@ -310,6 +316,12 @@ MESSAGES: dict[str, dict[str, str]] = {
         "task_complete": ":white_check_mark: *Task completed* ({elapsed:.0f}s)",
         "task_cancelled": ":stop_sign: Cancelled",
         "task_failed": ":x: Failed (exit {code})",
+        "task_interrupted_by_restart": (
+            ":electric_plug: {label}  Bridge restarted (likely due to a network outage) "
+            "and this task was interrupted.\n"
+            "_Last prompt_: {prompt}\n"
+            "Reply in this thread to resume with `--resume`."
+        ),
         "task_error": ":x: Error: {error}",
         "task_last_action": ":rewind: Last action: `{tool}` {summary}",
         "task_tools_used": "Tools used ({count}): {tools}",

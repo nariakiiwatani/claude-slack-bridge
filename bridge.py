@@ -153,6 +153,9 @@ DIRECTORY_HISTORY_MAX = 10
 SESSIONS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "sessions.json")
 SESSIONS_MAX_AGE_DAYS = 7
 SESSIONS_MAX_PER_CHANNEL = 50
+# プロセス突然死時の進行中タスクをトラッキング。
+# タスク開始/終了時にライブ書き換え。次回起動時に残っているエントリ = 中断タスク。
+INTERRUPTED_TASKS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "interrupted_tasks.json")
 
 # Team Agent用追加ツール
 TEAM_EXTRA_TOOLS = "TeamCreate,TeamDelete,SendMessage,TaskCreate,TaskUpdate,TaskList,Agent"
@@ -1892,6 +1895,9 @@ class ClaudeCodeRunner:
         self.lock = threading.Lock()
         self._task_counter = 0
         self.directory_history: dict[str, list[str]] = {}  # channel_id → [dir_path, ...]
+        # 進行中タスクのライブスナップショット（中断検出用）
+        self._interrupted_lock = threading.Lock()
+        self._active_tasks_snapshot: list[dict] = []
 
     def _next_id(self) -> int:
         self._task_counter += 1
@@ -2068,6 +2074,84 @@ class ClaudeCodeRunner:
         except Exception as e:
             logger.warning("Failed to save sessions: %s", e)
 
+    # ── 中断タスクトラッキング（プロセス突然死検出用） ──
+    def _write_interrupted_file_locked(self):
+        """interrupted_tasks.json を atomic に書き出す（_interrupted_lock 取得済み前提）"""
+        try:
+            if not self._active_tasks_snapshot:
+                try:
+                    os.remove(INTERRUPTED_TASKS_FILE)
+                except FileNotFoundError:
+                    pass
+                return
+            tmp = INTERRUPTED_TASKS_FILE + ".tmp"
+            with open(tmp, "w") as f:
+                json.dump(
+                    {"tasks": self._active_tasks_snapshot},
+                    f, ensure_ascii=False, indent=2,
+                )
+            os.replace(tmp, INTERRUPTED_TASKS_FILE)
+        except Exception as e:
+            logger.warning("Failed to write interrupted_tasks.json: %s", e)
+
+    def record_active_task(self, session: "Session", task: "Task"):
+        """タスク開始時にスナップショットを更新。1スレッド1エントリ。"""
+        entry = {
+            "channel_id": session.channel_id,
+            "thread_ts": session.thread_ts,
+            "label_emoji": session.label_emoji,
+            "label_name": session.label_name,
+            "claude_session_id": session.claude_session_id or task.resume_session,
+            "working_dir": session.working_dir,
+            "user_id": task.user_id,
+            "prompt": (task.prompt or "")[:500],
+            "started_at": task.started_at.isoformat() if task.started_at else None,
+        }
+        key = (session.channel_id, session.thread_ts)
+        with self._interrupted_lock:
+            self._active_tasks_snapshot = [
+                e for e in self._active_tasks_snapshot
+                if (e["channel_id"], e["thread_ts"]) != key
+            ]
+            self._active_tasks_snapshot.append(entry)
+            self._write_interrupted_file_locked()
+
+    def clear_active_task(self, session: "Session"):
+        """タスク終了時にスナップショットからエントリを除去。"""
+        key = (session.channel_id, session.thread_ts)
+        with self._interrupted_lock:
+            before = len(self._active_tasks_snapshot)
+            self._active_tasks_snapshot = [
+                e for e in self._active_tasks_snapshot
+                if (e["channel_id"], e["thread_ts"]) != key
+            ]
+            if len(self._active_tasks_snapshot) != before:
+                self._write_interrupted_file_locked()
+
+    def load_and_clear_interrupted_tasks(self) -> list[dict]:
+        """起動時呼び出し: ファイルを読んで返し、即削除する。"""
+        with self._interrupted_lock:
+            tasks: list[dict] = []
+            try:
+                with open(INTERRUPTED_TASKS_FILE, "r") as f:
+                    data = json.load(f)
+                if isinstance(data, dict):
+                    tasks = data.get("tasks") or []
+            except FileNotFoundError:
+                pass
+            except json.JSONDecodeError:
+                logger.warning("interrupted_tasks.json corrupted, treating as empty")
+            except Exception as e:
+                logger.warning("Failed to load interrupted_tasks.json: %s", e)
+            try:
+                os.remove(INTERRUPTED_TASKS_FILE)
+            except FileNotFoundError:
+                pass
+            except Exception as e:
+                logger.warning("Failed to remove interrupted_tasks.json: %s", e)
+            self._active_tasks_snapshot = []
+            return tasks
+
     def load_sessions(self) -> dict[str, dict[str, dict]]:
         """永続化セッション情報を読み込み"""
         try:
@@ -2227,6 +2311,8 @@ class ClaudeCodeRunner:
         thread_ts = session.thread_ts
         task.status = TaskStatus.RUNNING
         task.started_at = datetime.now()
+        # 進行中タスクスナップショットに記録（プロセス突然死検出用）
+        self.record_active_task(session, task)
 
         display_label = f"{session.label_emoji} {task.short_id}"
         is_resume = task.resume_session is not None
@@ -2475,6 +2561,9 @@ class ClaudeCodeRunner:
                 task.master_fd = None
             if registered_thread_ts and not is_takeover:
                 instance_threads.pop(registered_thread_ts, None)
+            # 進行中タスクスナップショットから除去
+            # （プロセスがここまで生きていれば「中断」ではないので)
+            self.clear_active_task(session)
 
     def _format_result(self, task: Task, session: Session, elapsed: float,
                        show_result: bool = True) -> tuple[str, list[dict], str | None]:
@@ -5194,6 +5283,33 @@ def main():
             )
         except Exception as e:
             logger.warning("Failed to send Slack startup notification: %s", e)
+
+    # 中断タスク復帰通知: 前回プロセスが進行中タスクを残したまま死んだ場合、
+    # 該当スレッドに「中断されました」を投稿する。
+    interrupted = runner.load_and_clear_interrupted_tasks()
+    if interrupted:
+        logger.info("Posting interruption notice for %d task(s)", len(interrupted))
+        for entry in interrupted:
+            emoji = entry.get("label_emoji") or ""
+            name = entry.get("label_name") or ""
+            label = (f"{emoji} {name}".strip()) or emoji or "(session)"
+            prompt = (entry.get("prompt") or "").strip()
+            prompt_short = prompt[:200] + ("…" if len(prompt) > 200 else "")
+            text = t("task_interrupted_by_restart",
+                     label=label,
+                     prompt=prompt_short or "(empty)")
+            try:
+                slack_client.chat_postMessage(
+                    channel=entry["channel_id"],
+                    thread_ts=entry["thread_ts"],
+                    text=text,
+                )
+                logger.info("Interruption notice posted thread=%s", entry.get("thread_ts"))
+            except Exception as e:
+                logger.warning(
+                    "Failed to post interruption notice thread=%s err=%s",
+                    entry.get("thread_ts"), e,
+                )
 
     handler = SocketModeHandler(app, SLACK_APP_TOKEN, trace_enabled=True)
 
