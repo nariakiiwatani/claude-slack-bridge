@@ -15,6 +15,9 @@ directory_history.json
 # Session persistence
 sessions.json
 
+# Interrupted tasks live snapshot
+interrupted_tasks.json
+
 # Channel root directories
 channel_roots.json
 
