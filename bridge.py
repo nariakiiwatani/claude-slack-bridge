@@ -455,6 +455,29 @@ TASK_LABELS = [
 ]
 
 
+# ── タスク進捗リアクション（差し替え式） ────
+REACTION_RECEIVED = "eyes"
+REACTION_RUNNING = "gear"
+REACTION_AWAITING_TOOL = "bell"
+REACTION_COMPLETED = "white_check_mark"
+REACTION_FAILED = "x"
+REACTION_CANCELLED = "stop_sign"
+
+
+def _build_reaction_targets(channel_id: str,
+                            request_msg_ts: str | None,
+                            thread_ts: str | None) -> list:
+    """進捗リアクションの付与対象 (channel_id, msg_ts) リストを構築。
+    - ユーザー指示メッセージ（あれば）
+    - スレッド返信トリガなら、スレッド親も追加（指示メッセージと別物のとき）"""
+    targets: list = []
+    if request_msg_ts:
+        targets.append((channel_id, request_msg_ts))
+    if thread_ts and thread_ts != request_msg_ts:
+        targets.append((channel_id, thread_ts))
+    return targets
+
+
 # ── データ構造（3層モデル: Project → Session → Task） ────
 class TaskStatus(Enum):
     QUEUED = "queued"
@@ -494,8 +517,11 @@ class Task:
     resume_session: Optional[str] = None
     fork_session: bool = False  # True: --fork-session 付きで起動（元セッションに影響を与えない分岐）
 
-    # ライフサイクルメッセージ（chat_update で段階的に更新するメッセージのts）
-    lifecycle_msg_ts: Optional[str] = None
+    # 進捗リアクション対象（channel_id, msg_ts のペアのリスト）
+    # ユーザー指示メッセージ + (スレッド返信なら) スレッド親 を入れる
+    reaction_targets: list = field(default_factory=list)
+    # 現在付与中のリアクション名（差し替え時の remove に使用）
+    current_reaction: Optional[str] = None
 
     @property
     def short_id(self) -> str:
@@ -1209,16 +1235,9 @@ def _monitor_session_jsonl(inst: dict, thread_ts: str, channel: str, client: Web
         else:
             sid = entry.get("sessionId")
         if sid and session_ref:
-            prev_sid = session_ref.claude_session_id
             logger.debug("JSONL monitor: session_id acquired sid=%s thread=%s", sid[:16] if sid else None, thread_ts)
             session_ref.claude_session_id = sid
             runner.save_sessions()
-            # セッションID取得時にライフサイクルメッセージを更新（初回のみ）
-            if not prev_sid and task_ref and task_ref.lifecycle_msg_ts:
-                running_text = runner._build_lifecycle_text(
-                    session_ref, task_ref, "lifecycle_running", session_id=sid
-                )
-                runner._update_lifecycle_msg(session_ref, task_ref, running_text)
         if not task_ref:
             return
         # result type
@@ -2305,7 +2324,8 @@ class ClaudeCodeRunner:
             task.status = TaskStatus.FAILED
             task.error = t("task_working_dir_not_set")
             task.completed_at = datetime.now()
-            self._update_lifecycle_msg(session, task, f"{session.label_emoji} {task.short_id}  :x: {t('task_working_dir_not_set')}")
+            self._post_to_session(session, f"{session.label_emoji} {task.short_id}  :x: {t('task_working_dir_not_set')}")
+            self._swap_task_reaction(task, REACTION_FAILED)
             return
         channel_id = session.channel_id
         thread_ts = session.thread_ts
@@ -2316,10 +2336,6 @@ class ClaudeCodeRunner:
 
         display_label = f"{session.label_emoji} {task.short_id}"
         is_resume = task.resume_session is not None
-
-        # Stage 2: タスク準備中（ライフサイクルメッセージを更新）
-        preparing_text = self._build_lifecycle_text(session, task, "lifecycle_preparing")
-        self._update_lifecycle_msg(session, task, preparing_text)
 
         # PTYモード判定: プロンプトが200KB以下ならCLI引数で渡しPTYを使用
         prompt_bytes = task.prompt.encode("utf-8")
@@ -2399,9 +2415,8 @@ class ClaudeCodeRunner:
                 proc.stdin.write(task.prompt)
                 proc.stdin.close()
 
-            # Stage 3: タスク実行中（ライフサイクルメッセージを更新）
-            running_text = self._build_lifecycle_text(session, task, "lifecycle_running")
-            self._update_lifecycle_msg(session, task, running_text)
+            # 実行中リアクションへ差し替え
+            self._swap_task_reaction(task, REACTION_RUNNING)
 
             # JONLファイルが現れるまでポーリング（プロセス終了まで探し続ける）
             # resumeタスクの場合、session_idからファイル名で直接特定する
@@ -2468,6 +2483,7 @@ class ClaudeCodeRunner:
             # 外部テイクオーバーによる終了: 既にCOMPLETED設定済み
             if task.status == TaskStatus.COMPLETED and inst and inst.get("bind_mode") == "live":
                 logger.info("_execute: task ended via external takeover, skipping completion flow thread=%s", thread_ts)
+                self._swap_task_reaction(task, REACTION_COMPLETED)
                 self._cleanup_status_message(inst, session, task)
                 # テイクオーバー後のJSONLパスをクリーンアップ
                 # （テイクオーバー時に _monitored_jsonl_paths に追加された新パス）
@@ -2479,6 +2495,7 @@ class ClaudeCodeRunner:
             if task.status == TaskStatus.CANCELLED:
                 self._post_completion(session, task,
                                       f"{display_label}  {t('task_cancelled')}", inst)
+                self._swap_task_reaction(task, REACTION_CANCELLED)
                 self._cleanup_status_message(inst, session, task)
                 return
 
@@ -2512,6 +2529,9 @@ class ClaudeCodeRunner:
                 fallback_text, blocks, full_result = self._format_result(
                     task, session, elapsed, show_result=True
                 )
+                # 完了リアクション。_post_completion 内の _check_tool_request が
+                # TOOL_REQUEST マーカーを検出した場合は内部で REACTION_AWAITING_TOOL に上書きする。
+                self._swap_task_reaction(task, REACTION_COMPLETED)
                 self._post_completion(session, task, fallback_text, inst,
                                       full_result=full_result, blocks=blocks)
             else:
@@ -2526,6 +2546,7 @@ class ClaudeCodeRunner:
                     last_tc = task.tool_calls[-1]
                     error_parts.append(t("task_last_action", tool=last_tc["name"], summary=last_tc.get("input", "")[:100]))
                 error_parts.append(f"```{stderr_output[:1000]}```")
+                self._swap_task_reaction(task, REACTION_FAILED)
                 self._post_completion(
                     session, task,
                     "\n".join(error_parts),
@@ -2544,6 +2565,7 @@ class ClaudeCodeRunner:
             if task.tool_calls:
                 last_tc = task.tool_calls[-1]
                 error_parts.append(t("task_last_action", tool=last_tc["name"], summary=last_tc.get("input", "")[:100]))
+            self._swap_task_reaction(task, REACTION_FAILED)
             self._post_completion(session, task,
                                   "\n".join(error_parts), inst)
             self._cleanup_status_message(inst, session, task)
@@ -2643,61 +2665,30 @@ class ClaudeCodeRunner:
             if task.id == 0:
                 task.id = self._next_id()
 
-    def _build_lifecycle_text(self, session: Session, task: Task, status_key: str,
-                              *, session_id: str | None = None) -> str:
-        """ライフサイクルメッセージのテキストを組み立てる"""
-        display_label = f"{session.label_emoji} {task.short_id}"
-        is_resume = task.resume_session is not None
-        cwd = session.working_dir or ""
-        dir_display = os.path.basename(cwd) or cwd
-
-        status_text = t(status_key)
-        parts = [f"{display_label}  {status_text}"]
-
-        if is_resume:
-            parts.append(t("task_resume_header"))
-        else:
-            parts.append(f":file_folder: `{dir_display}`")
-
-        if session_id:
-            parts.append(f"_Session: `{session_id[:12]}...`_")
-
-        parts.append(f"```{task.prompt[:500]}```")
-        return "\n".join(parts)
-
-    def _post_lifecycle_msg(self, session: Session, task: Task, text: str):
-        """ライフサイクルメッセージを初回投稿し、tsをtaskに保存"""
-        try:
-            if session.thread_ts:
-                resp = self.client.chat_postMessage(
-                    channel=session.channel_id,
-                    thread_ts=session.thread_ts,
-                    text=text,
-                )
-            else:
-                resp = self.client.chat_postMessage(
-                    channel=session.channel_id,
-                    text=text,
-                )
-                session.thread_ts = resp["ts"]
-            task.lifecycle_msg_ts = resp["ts"]
-        except Exception as e:
-            logger.error("Lifecycle initial post error: %s", e)
-
-    def _update_lifecycle_msg(self, session: Session, task: Task, text: str):
-        """ライフサイクルメッセージを更新（chat_update）。ts未設定時は新規投稿にフォールバック"""
-        if task.lifecycle_msg_ts:
-            try:
-                self.client.chat_update(
-                    channel=session.channel_id,
-                    ts=task.lifecycle_msg_ts,
-                    text=text,
-                )
-                return
-            except Exception as e:
-                logger.error("Lifecycle message update error: %s", e)
-        # フォールバック: 新規投稿
-        self._post_lifecycle_msg(session, task, text)
+    def _swap_task_reaction(self, task: Task, new_reaction: str | None):
+        """task.reaction_targets 全てに対して、現在のリアクションを外し new_reaction を付与。
+        new_reaction=None なら除去のみ。ベストエフォート（失敗は debug ログのみ）。"""
+        old = task.current_reaction
+        if old == new_reaction:
+            return
+        for channel_id, msg_ts in task.reaction_targets:
+            if old:
+                try:
+                    self.client.reactions_remove(
+                        channel=channel_id, timestamp=msg_ts, name=old,
+                    )
+                except Exception as e:
+                    logger.debug("reactions_remove (best-effort) %s on %s/%s: %s",
+                                 old, channel_id, msg_ts, e)
+            if new_reaction:
+                try:
+                    self.client.reactions_add(
+                        channel=channel_id, timestamp=msg_ts, name=new_reaction,
+                    )
+                except Exception as e:
+                    logger.debug("reactions_add (best-effort) %s on %s/%s: %s",
+                                 new_reaction, channel_id, msg_ts, e)
+        task.current_reaction = new_reaction
 
     def _post_to_session(self, session: Session, text: str):
         """セッション（スレッド）にメッセージを投稿"""
@@ -2734,19 +2725,9 @@ class ClaudeCodeRunner:
                          text: str, inst: dict | None,
                          *, full_result: str | None = None,
                          blocks: list[dict] | None = None):
-        """完了メッセージ: ライフサイクルメッセージを削除 + 新規メッセージ投稿 + 添付ファイル送信。
+        """完了メッセージを投稿 + 添付ファイル送信。
         blocks 指定時は chat_postMessage で本文を blocks 形式で投稿し、ファイルは別投稿で添付する
         （files_upload_v2 の initial_comment は blocks 非対応のため2リクエストに分割）。"""
-        # ライフサイクルメッセージを削除（完了メッセージで置き換えるため）
-        if task.lifecycle_msg_ts:
-            try:
-                self.client.chat_delete(
-                    channel=session.channel_id,
-                    ts=task.lifecycle_msg_ts,
-                )
-            except Exception as e:
-                logger.debug("Lifecycle message delete (best-effort): %s", e)
-
         # 添付ファイル準備
         status_history = inst.get("_status_history", []) if inst else []
         file_uploads: list[dict] = []
@@ -2915,6 +2896,10 @@ class ClaudeCodeRunner:
             )
         except Exception as e:
             logger.error("Tool request button post error: %s", e)
+
+        # 進捗リアクションを「ツール許可待ち」に上書き
+        # （直前で _swap_task_reaction(REACTION_COMPLETED) されているので、bell に差し替え）
+        self._swap_task_reaction(task, REACTION_AWAITING_TOOL)
 
     def _cleanup_status_message(self, inst: dict | None, session: Session, task: Task):
         """タスク完了時: 進捗メッセージを削除"""
@@ -3195,7 +3180,8 @@ def handle_message(event, say):
                 # 新タスクとして --resume 続行（メンション有無問わず）
                 resolved_files = _resolve_event_files(event, channel_id)
                 _handle_thread_reply_task(
-                    input_text, project, session, say, parent_ts, user_id, resolved_files
+                    input_text, project, session, say, parent_ts, user_id, resolved_files,
+                    request_msg_ts=event.get("ts"),
                 )
                 return
 
@@ -3261,7 +3247,8 @@ def _build_question_answer_prompt(question_text: str, options: list[dict],
 
 def _handle_thread_reply_task(prompt: str, project: Project, session: Session,
                               say, thread_ts: str, user_id: str,
-                              files: list[dict] | None = None):
+                              files: list[dict] | None = None,
+                              request_msg_ts: str | None = None):
     """スレッド返信を --resume で新タスクとして実行"""
     # pending_question がある場合、回答を質問コンテキスト付きプロンプトに変換
     pq = session.pending_question
@@ -3328,10 +3315,12 @@ def _handle_thread_reply_task(prompt: str, project: Project, session: Session,
     else:
         logger.warning("_handle_thread_reply_task: no session_id, running new task without --resume thread=%s", thread_ts)
 
-    # Stage 1: リクエスト受付を即時投稿
+    # 受付リアクション
     runner.assign_task_id(task)
-    text = runner._build_lifecycle_text(session, task, "lifecycle_received")
-    runner._post_lifecycle_msg(session, task, text)
+    task.reaction_targets = _build_reaction_targets(
+        session.channel_id, request_msg_ts, thread_ts,
+    )
+    runner._swap_task_reaction(task, REACTION_RECEIVED)
 
     logger.info("_handle_thread_reply_task: calling run_task thread=%s resume=%s disallowed=%s",
                 thread_ts, task.resume_session[:16] if task.resume_session else "None", task.disallowed_tools)
@@ -3346,6 +3335,7 @@ def _dispatch_command(text: str, event: dict, say):
     channel_id = event.get("channel", "")
     thread_ts = event.get("ts")
     user_id = event.get("user", "")
+    request_msg_ts = event.get("ts")
 
     cmd_lower = text.lower()
 
@@ -3375,7 +3365,9 @@ def _dispatch_command(text: str, event: dict, say):
         if not rest:
             _handle_fork_list(say, thread_ts, channel_id, user_id)
         else:
-            _handle_fork(rest, say, thread_ts, channel_id, user_id, _resolve_event_files(event, channel_id))
+            _handle_fork(rest, say, thread_ts, channel_id, user_id,
+                         _resolve_event_files(event, channel_id),
+                         request_msg_ts=request_msg_ts)
         return
 
     # ── bind [<PID>] ──
@@ -3406,7 +3398,9 @@ def _dispatch_command(text: str, event: dict, say):
     # ── team [in <path>] <タスク> ──
     if cmd_lower == "team" or cmd_lower.startswith("team "):
         rest = text[4:].strip()
-        _handle_team(rest, say, thread_ts, channel_id, user_id, _resolve_event_files(event, channel_id))
+        _handle_team(rest, say, thread_ts, channel_id, user_id,
+                     _resolve_event_files(event, channel_id),
+                     request_msg_ts=request_msg_ts)
         return
 
     # ── root [<path>|clear] ──
@@ -3416,7 +3410,9 @@ def _dispatch_command(text: str, event: dict, say):
 
     # ── in <path> <タスク> ──
     if cmd_lower.startswith("in "):
-        _handle_in_dir(text, say, thread_ts, channel_id, user_id, _resolve_event_files(event, channel_id))
+        _handle_in_dir(text, say, thread_ts, channel_id, user_id,
+                       _resolve_event_files(event, channel_id),
+                       request_msg_ts=request_msg_ts)
         return
 
     # ── ベアタスク → ディレクトリ選択 or 履歴から自動 ──
@@ -3760,7 +3756,13 @@ def _handle_tool_request_action(ack, body, scope: str):
 
     session.pending_tool_request = None
 
+    # ツール許可待ち中の前タスク（bell リアクション中）。承認/拒否でリアクションを差し替える。
+    prev_task = session.tasks[-1] if session.tasks else None
+
     if scope == "reject":
+        # 却下: 前タスク自体は正常完了していたので white_check_mark に戻す
+        if prev_task:
+            runner._swap_task_reaction(prev_task, REACTION_COMPLETED)
         return
 
     # スコープに応じてSession/Projectにツールを記憶
@@ -3777,6 +3779,8 @@ def _handle_tool_request_action(ack, body, scope: str):
     # 承認: 要求ツールを追加して --resume で再実行
     if not session.claude_session_id:
         logger.warning("Tool request approve: no session_id for resume thread=%s", thread_ts)
+        if prev_task:
+            runner._swap_task_reaction(prev_task, REACTION_COMPLETED)
         return
     base_tools = DEFAULT_ALLOWED_TOOLS
     added = ",".join(requested_tools)
@@ -3793,9 +3797,16 @@ def _handle_tool_request_action(ack, body, scope: str):
     )
     task.resume_session = session.claude_session_id
 
+    # 前タスクの bell を外して、新タスクのリアクション対象を引き継ぐ
+    if prev_task:
+        inherited_targets = list(prev_task.reaction_targets)
+        runner._swap_task_reaction(prev_task, None)
+    else:
+        inherited_targets = []
+
     runner.assign_task_id(task)
-    text = runner._build_lifecycle_text(session, task, "lifecycle_received")
-    runner._post_lifecycle_msg(session, task, text)
+    task.reaction_targets = inherited_targets
+    runner._swap_task_reaction(task, REACTION_RECEIVED)
 
     err = runner.run_task(project, session, task)
     if err:
@@ -3956,7 +3967,8 @@ def _handle_cancel_in_thread(say, thread_ts: str, channel_id: str):
 
 
 def _handle_team(rest: str, say, thread_ts: str, channel_id: str,
-                  user_id: str = "", files: list[dict] | None = None):
+                  user_id: str = "", files: list[dict] | None = None,
+                  request_msg_ts: str | None = None):
     """team [in <path>] <タスク> — Team Agentモードでタスク実行。
     プロンプトにチーム指示を注入し、allowedToolsにTeam系ツールを追加する。"""
     if not rest:
@@ -4020,8 +4032,10 @@ def _handle_team(rest: str, say, thread_ts: str, channel_id: str,
         user_id=user_id,
     )
     runner.assign_task_id(task)
-    text = runner._build_lifecycle_text(session, task, "lifecycle_received")
-    runner._post_lifecycle_msg(session, task, text)
+    task.reaction_targets = _build_reaction_targets(
+        channel_id, request_msg_ts, thread_ts,
+    )
+    runner._swap_task_reaction(task, REACTION_RECEIVED)
 
     err = runner.run_task(project, session, task)
     if err:
@@ -4071,7 +4085,8 @@ def _handle_root(text: str, say, thread_ts: str, channel_id: str):
 
 def _start_task_in_dir(dir_path: str, prompt: str, say, thread_ts: str,
                        channel_id: str, user_id: str = "",
-                       files: list[dict] | None = None):
+                       files: list[dict] | None = None,
+                       request_msg_ts: str | None = None):
     """指定ディレクトリでProject取得→Session作成→Task実行の共通ヘルパー"""
     project = runner.get_or_create_project(channel_id)
     session = project.get_or_create_session(thread_ts)
@@ -4090,10 +4105,12 @@ def _start_task_in_dir(dir_path: str, prompt: str, say, thread_ts: str,
         allowed_tools=session.consume_tools(),
         user_id=user_id,
     )
-    # Stage 1: リクエスト受付を即時投稿
+    # 受付リアクション
     runner.assign_task_id(task)
-    text = runner._build_lifecycle_text(session, task, "lifecycle_received")
-    runner._post_lifecycle_msg(session, task, text)
+    task.reaction_targets = _build_reaction_targets(
+        channel_id, request_msg_ts, thread_ts,
+    )
+    runner._swap_task_reaction(task, REACTION_RECEIVED)
 
     err = runner.run_task(project, session, task)
     if err:
@@ -4101,7 +4118,8 @@ def _start_task_in_dir(dir_path: str, prompt: str, say, thread_ts: str,
 
 
 def _handle_in_dir(text: str, say, thread_ts, channel_id: str, user_id: str = "",
-                   files: list[dict] | None = None):
+                   files: list[dict] | None = None,
+                   request_msg_ts: str | None = None):
     """in <path> <task> — 指定ディレクトリで即座に実行"""
     rest = text[3:].strip()
     parts = rest.split(maxsplit=1)
@@ -4128,7 +4146,8 @@ def _handle_in_dir(text: str, say, thread_ts, channel_id: str, user_id: str = ""
         say(text=t("error_dir_not_found", path=dir_path), thread_ts=thread_ts)
         return
 
-    _start_task_in_dir(dir_path, prompt, say, thread_ts, channel_id, user_id, files)
+    _start_task_in_dir(dir_path, prompt, say, thread_ts, channel_id, user_id, files,
+                       request_msg_ts=request_msg_ts)
 
 
 def _parse_thread_link(text: str) -> tuple[str | None, str | None]:
@@ -4174,7 +4193,8 @@ def _search_forkable_sessions(query: str, channel_id: str) -> list[dict]:
 
 
 def _handle_fork(rest: str, say, thread_ts, channel_id: str, user_id: str,
-                 files: list[dict] | None = None):
+                 files: list[dict] | None = None,
+                 request_msg_ts: str | None = None):
     """fork <PID|スレッドリンク|ラベル|セッションID> [<task>] — セッションをフォーク"""
     parts = rest.split(maxsplit=1)
     identifier = parts[0]
@@ -4200,7 +4220,8 @@ def _handle_fork(rest: str, say, thread_ts, channel_id: str, user_id: str,
                 say(text=t("fork_pid_not_found", pid=target_pid), thread_ts=thread_ts)
             return
 
-        _execute_fork(matched[0], channel_id, say, thread_ts, user_id, initial_input)
+        _execute_fork(matched[0], channel_id, say, thread_ts, user_id, initial_input,
+                      request_msg_ts=request_msg_ts)
         return
     except ValueError:
         pass
@@ -4234,6 +4255,7 @@ def _handle_fork(rest: str, say, thread_ts, channel_id: str, user_id: str,
             user_id=user_id,
             initial_input=initial_input,
             source_label=s.display_label or s.claude_session_id[:12],
+            request_msg_ts=request_msg_ts,
         )
         return
 
@@ -4253,6 +4275,7 @@ def _handle_fork(rest: str, say, thread_ts, channel_id: str, user_id: str,
         "thread_ts": thread_ts,
         "user_id": user_id,
         "initial_input": initial_input,
+        "request_msg_ts": request_msg_ts,
     }
 
 
@@ -4391,7 +4414,8 @@ def _handle_fork_list(say, thread_ts, channel_id: str, user_id: str):
 def _execute_fork_session(source_session_id: str, cwd: str, channel_id: str,
                           say, thread_ts: str, user_id: str,
                           initial_input: str | None = None,
-                          source_label: str = ""):
+                          source_label: str = "",
+                          request_msg_ts: str | None = None):
     """セッションIDからフォーク実行（共通処理）。
     initial_input がある場合: 即座に --resume --fork-session でCLIを起動。
     initial_input がない場合: セッション登録のみ（pending_fork=True）。
@@ -4429,8 +4453,10 @@ def _execute_fork_session(source_session_id: str, cwd: str, channel_id: str,
     task.fork_session = True
 
     runner.assign_task_id(task)
-    lc_text = runner._build_lifecycle_text(session, task, "lifecycle_received")
-    runner._post_lifecycle_msg(session, task, lc_text)
+    task.reaction_targets = _build_reaction_targets(
+        channel_id, request_msg_ts, thread_ts,
+    )
+    runner._swap_task_reaction(task, REACTION_RECEIVED)
 
     err = runner.run_task(project, session, task)
     if err:
@@ -4438,7 +4464,8 @@ def _execute_fork_session(source_session_id: str, cwd: str, channel_id: str,
 
 
 def _execute_fork(inst: dict, channel_id: str, say, thread_ts, user_id: str,
-                  initial_input: str | None = None):
+                  initial_input: str | None = None,
+                  request_msg_ts: str | None = None):
     """外部プロセスからのフォーク実行: session_id を取得して --fork-session で分岐"""
     pid = inst["pid"]
     cwd = inst["cwd"]
@@ -4468,6 +4495,7 @@ def _execute_fork(inst: dict, channel_id: str, say, thread_ts, user_id: str,
         user_id=user_id,
         initial_input=initial_input,
         source_label=f"PID {pid}",
+        request_msg_ts=request_msg_ts,
     )
 
 
@@ -4482,6 +4510,7 @@ def _handle_fork_selection(text: str, say, channel_id: str) -> bool:
     thread_ts = selection["thread_ts"]
     user_id = selection["user_id"]
     initial_input = selection.get("initial_input")
+    request_msg_ts = selection.get("request_msg_ts")
     input_text = text.strip().lower()
 
     # cancel
@@ -4508,7 +4537,8 @@ def _handle_fork_selection(text: str, say, channel_id: str) -> bool:
         if not _is_process_alive(opt_data["pid"]):
             say(text=t("fork_pid_exited", pid=opt_data['pid']), thread_ts=thread_ts)
             return True
-        _execute_fork(opt_data, channel_id, say, thread_ts, user_id, initial_input)
+        _execute_fork(opt_data, channel_id, say, thread_ts, user_id, initial_input,
+                      request_msg_ts=request_msg_ts)
     else:
         # ブリッジセッション
         s = opt_data["session"]
@@ -4521,6 +4551,7 @@ def _handle_fork_selection(text: str, say, channel_id: str) -> bool:
             user_id=user_id,
             initial_input=initial_input,
             source_label=s.display_label or s.claude_session_id[:12],
+            request_msg_ts=request_msg_ts,
         )
     return True
 
@@ -5127,6 +5158,7 @@ def _idle_takeover_monitor_loop():
 def _handle_bare_task(text: str, event: dict, say, channel_id: str, user_id: str):
     """ベアタスク: ルート設定時は即実行、なければフォーク候補 + ディレクトリ履歴を表示し選択を待つ"""
     thread_ts = event.get("ts")
+    request_msg_ts = event.get("ts")
     files = _resolve_event_files(event, channel_id)
 
     # ルートディレクトリが設定されている場合は即実行
@@ -5138,7 +5170,8 @@ def _handle_bare_task(text: str, event: dict, say, channel_id: str, user_id: str
                 thread_ts=thread_ts,
             )
             return
-        _start_task_in_dir(root, text, say, thread_ts, channel_id, user_id, files)
+        _start_task_in_dir(root, text, say, thread_ts, channel_id, user_id, files,
+                           request_msg_ts=request_msg_ts)
         return
 
     # フォーク候補を収集
@@ -5185,6 +5218,7 @@ def _handle_bare_task(text: str, event: dict, say, channel_id: str, user_id: str
         "channel_id": channel_id,
         "options": options,
         "files": files,
+        "request_msg_ts": request_msg_ts,
     }
 
 
@@ -5200,6 +5234,7 @@ def _handle_directory_selection(text: str, say, thread_ts: str) -> bool:
     channel_id = req["channel_id"]
     options = req["options"]
     files = req.get("files")
+    request_msg_ts = req.get("request_msg_ts")
     input_text = text.strip()
 
     # cancel
@@ -5224,14 +5259,16 @@ def _handle_directory_selection(text: str, say, thread_ts: str) -> bool:
             if not _is_process_alive(opt_data["pid"]):
                 say(text=t("fork_pid_exited", pid=opt_data['pid']), thread_ts=thread_ts)
                 return True
-            _execute_fork(opt_data, channel_id, say, thread_ts, user_id, prompt)
+            _execute_fork(opt_data, channel_id, say, thread_ts, user_id, prompt,
+                          request_msg_ts=request_msg_ts)
             return True
         else:
             # ディレクトリ選択
             if not os.path.isdir(opt_data):
                 say(text=t("error_dir_not_found", path=opt_data), thread_ts=thread_ts)
                 return True
-            _start_task_in_dir(opt_data, prompt, say, thread_ts, channel_id, user_id, files)
+            _start_task_in_dir(opt_data, prompt, say, thread_ts, channel_id, user_id, files,
+                               request_msg_ts=request_msg_ts)
             return True
 
     # 絶対パス入力
@@ -5241,7 +5278,8 @@ def _handle_directory_selection(text: str, say, thread_ts: str) -> bool:
         if not os.path.isdir(expanded):
             say(text=t("error_dir_not_found", path=expanded), thread_ts=thread_ts)
             return True
-        _start_task_in_dir(expanded, prompt, say, thread_ts, channel_id, user_id, files)
+        _start_task_in_dir(expanded, prompt, say, thread_ts, channel_id, user_id, files,
+                           request_msg_ts=request_msg_ts)
         return True
 
     # 数字でもcancelでも絶対パスでもない → fallthroughしない（選択中なので）

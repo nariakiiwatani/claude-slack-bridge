@@ -66,6 +66,7 @@ If you prefer to configure the Slack App manually.
    - `groups:history` — Read private channel messages
    - `files:read` — Read files (for attachment downloads)
    - `files:write` — Upload files (for large results)
+   - `reactions:write` — Add/remove reactions (task progress indicators)
 
 ### 4. Configure Event Subscriptions
 
@@ -221,6 +222,7 @@ Slack Appを手動で設定したい場合。
    - `groups:history` — プライベートチャンネルのメッセージ読み取り
    - `files:read` — ファイル読み取り（添付ファイルダウンロード用）
    - `files:write` — ファイル送信（結果が大きい場合用）
+   - `reactions:write` — リアクション付与/除去（タスク進捗の可視化）
 
 ### 4. Event Subscriptions を設定
 

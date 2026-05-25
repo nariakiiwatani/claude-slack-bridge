@@ -47,14 +47,7 @@ MESSAGES: dict[str, dict[str, str]] = {
         "status_recent_tools": "最近: {tools}",
         "status_continued": "...(続き)",
 
-        # ── lifecycle (段階的メッセージ更新) ──
-        "lifecycle_received": ":inbox_tray: *リクエスト受付*",
-        "lifecycle_preparing": ":rocket: *タスク準備中...*",
-        "lifecycle_running": ":gear: *タスク実行中*",
-
         # ── task ──
-        "task_start_header": "*タスク開始*",
-        "task_resume_header": ":arrow_forward: *セッション続行*",
         "task_complete": ":white_check_mark: *タスク完了* ({elapsed:.0f}秒)",
         "task_cancelled": ":stop_sign: キャンセルされました",
         "task_failed": ":x: 失敗 (exit {code})",
@@ -305,14 +298,7 @@ MESSAGES: dict[str, dict[str, str]] = {
         "status_recent_tools": "Recent: {tools}",
         "status_continued": "...(continued)",
 
-        # ── lifecycle ──
-        "lifecycle_received": ":inbox_tray: *Request received*",
-        "lifecycle_preparing": ":rocket: *Preparing task...*",
-        "lifecycle_running": ":gear: *Task running*",
-
         # ── task ──
-        "task_start_header": "*Task started*",
-        "task_resume_header": ":arrow_forward: *Session resumed*",
         "task_complete": ":white_check_mark: *Task completed* ({elapsed:.0f}s)",
         "task_cancelled": ":stop_sign: Cancelled",
         "task_failed": ":x: Failed (exit {code})",
