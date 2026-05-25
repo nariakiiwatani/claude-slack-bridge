@@ -177,6 +177,13 @@ MESSAGES: dict[str, dict[str, str]] = {
             "チャンネルで `@bot in <path> <タスク>` を送信してください"
         ),
         "notify_shutdown": ":wave: Claude Code Bridge を停止しました",
+        "notify_missing_scopes": (
+            ":warning: *Slack Bot の権限が不足しています*\n"
+            "未付与のスコープ: `{scopes}`\n"
+            "Slack App 設定の *OAuth & Permissions* で上記スコープを追加し、"
+            "ワークスペースに再インストール（再認可）してください。\n"
+            "このままだと一部機能（タスク進捗リアクションなど）が動作しません。"
+        ),
 
         # ── question (CLI質問表示) ──
         "question_cli_header": ":question: *CLIからの質問*",
@@ -428,6 +435,13 @@ MESSAGES: dict[str, dict[str, str]] = {
             "Send `@bot in <path> <task>` in a channel to begin"
         ),
         "notify_shutdown": ":wave: Claude Code Bridge stopped",
+        "notify_missing_scopes": (
+            ":warning: *Slack Bot is missing permissions*\n"
+            "Scopes not granted: `{scopes}`\n"
+            "Add them under *OAuth & Permissions* in your Slack App settings and "
+            "reinstall (re-authorize) to the workspace.\n"
+            "Until then, some features (e.g. task progress reactions) will not work."
+        ),
 
         # ── question ──
         "question_cli_header": ":question: *Question from CLI*",

@@ -3013,6 +3013,51 @@ app = App(token=SLACK_BOT_TOKEN)
 slack_client = WebClient(token=SLACK_BOT_TOKEN)
 runner = ClaudeCodeRunner(slack_client)
 
+# 必要な Bot Token スコープ（起動時に付与状況を検証する）。
+# setup-guide.md の Bot Token Scopes と一致させること。
+REQUIRED_BOT_SCOPES = [
+    "chat:write",
+    "channels:history",
+    "groups:history",
+    "files:read",
+    "files:write",
+    "reactions:write",
+]
+
+
+def _check_bot_scopes():
+    """起動時に Bot Token の付与済みスコープを検証する。
+    必要なスコープが欠けていれば warning ログ + Slack 通知
+    （NOTIFICATION_CHANNEL、なければ管理者へDM）で再認可を促す。
+    検証不能なとき（auth_test 失敗・ヘッダ欠落）は何もしないベストエフォート。"""
+    try:
+        resp = slack_client.auth_test()
+    except Exception as e:
+        logger.warning("スコープ検証をスキップ（auth_test 失敗）: %s", e)
+        return
+    # 付与済みスコープは x-oauth-scopes レスポンスヘッダにカンマ区切りで入る
+    headers = getattr(resp, "headers", None) or {}
+    granted_raw = next(
+        (v for k, v in headers.items() if k.lower() == "x-oauth-scopes"), None
+    )
+    if not granted_raw:
+        logger.debug("スコープ検証をスキップ: x-oauth-scopes ヘッダなし")
+        return
+    granted = {s.strip() for s in granted_raw.split(",") if s.strip()}
+    missing = [s for s in REQUIRED_BOT_SCOPES if s not in granted]
+    if not missing:
+        logger.info("Bot スコープ OK（%d 件付与）", len(granted))
+        return
+    missing_str = ", ".join(missing)
+    logger.warning("Bot Token のスコープ不足: %s — 再認可が必要です", missing_str)
+    target = NOTIFICATION_CHANNEL or ADMIN_SLACK_USER_ID
+    try:
+        slack_client.chat_postMessage(
+            channel=target, text=t("notify_missing_scopes", scopes=missing_str)
+        )
+    except Exception as e:
+        logger.warning("スコープ不足通知の送信に失敗: %s", e)
+
 # スレッドts → インスタンス情報のマッピング（起動時に検出したclaude CLIプロセス用）
 instance_threads: dict[str, dict] = {}
 
@@ -5321,6 +5366,9 @@ def main():
             )
         except Exception as e:
             logger.warning("Failed to send Slack startup notification: %s", e)
+
+    # Bot Token スコープ検証: 不足があれば再認可を促す通知を送る
+    _check_bot_scopes()
 
     # 中断タスク復帰通知: 前回プロセスが進行中タスクを残したまま死んだ場合、
     # 該当スレッドに「中断されました」を投稿する。
