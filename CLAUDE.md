@@ -24,9 +24,8 @@ Terminal-Slack bidirectional sync:
 The bridge runs as a macOS LaunchAgent (`com.user.claude-slack-bridge`). Use `scripts/install.sh` for initial setup.
 
 ```bash
-# Restart (stop + start via launchctl)
-launchctl bootout gui/$(id -u)/com.user.claude-slack-bridge
-launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.user.claude-slack-bridge.plist
+# Restart (works from anywhere, including from within the bridge itself)
+scripts/restart.sh
 
 # Status
 launchctl print gui/$(id -u)/com.user.claude-slack-bridge
@@ -34,6 +33,11 @@ launchctl print gui/$(id -u)/com.user.claude-slack-bridge
 # Logs
 tail -f ~/Library/Logs/claude-slack-bridge/stderr.log
 ```
+
+`scripts/restart.sh` は loaded なら `launchctl kickstart -k`、未 load なら `bootstrap` を使う。
+kickstart は launchd への指示のみで完結するため、ブリッジ自身のタスクから呼んでも安全
+（呼び出し元プロセスツリーが SIGTERM を受けても、再起動は launchd と KeepAlive=true が完遂する）。
+`bootout && bootstrap` の chain は自殺で右辺が走らないため、自己再起動には使ってはいけない。
 
 Do NOT start bridge.py directly with `python bridge.py` — always use launchctl.
 

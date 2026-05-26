@@ -1,5 +1,14 @@
 #!/bin/bash
 # claude-slack-bridge LaunchAgent 再起動
+#
+# 動作:
+#   - 既にロード済み → `launchctl kickstart -k` で SIGTERM 送信 → KeepAlive で自動再起動
+#   - 未ロード（bootout 後など）→ `launchctl bootstrap` で初回ロード
+#
+# kickstart はサービスをアンロードせず launchd への指示のみで完結するため、
+# ブリッジ自身からこのスクリプトを呼んでも（呼び出し元プロセスが死んでも）
+# 再起動は launchd 側で完遂する。bootout は呼び出し元のプロセスツリーごと
+# 殺すため、自己再起動には使えない。
 set -euo pipefail
 
 LABEL="com.user.claude-slack-bridge"
@@ -11,17 +20,10 @@ if [ ! -f "$PLIST_PATH" ]; then
     exit 1
 fi
 
-if launchctl list "$LABEL" &>/dev/null; then
-    launchctl bootout "$DOMAIN/$LABEL"
-    echo "停止しました"
-    # プロセス完全終了を待つ（bootoutは非同期の場合がある）
-    for i in $(seq 1 15); do
-        if ! launchctl list "$LABEL" &>/dev/null; then
-            break
-        fi
-        sleep 1
-    done
+if launchctl print "$DOMAIN/$LABEL" &>/dev/null; then
+    launchctl kickstart -k "$DOMAIN/$LABEL"
+    echo "再起動しました (kickstart)"
+else
+    launchctl bootstrap "$DOMAIN" "$PLIST_PATH"
+    echo "起動しました (bootstrap)"
 fi
-
-launchctl bootstrap "$DOMAIN" "$PLIST_PATH"
-echo "起動しました"
