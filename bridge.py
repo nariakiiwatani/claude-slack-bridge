@@ -38,6 +38,7 @@ import re
 import select
 import shutil
 import signal
+import socket
 import struct
 import subprocess
 import sys
@@ -2973,6 +2974,19 @@ class ClaudeCodeRunner:
             cancelled += self.cancel_all_in_project(channel_id)
         return cancelled
 
+    def has_running_tasks(self) -> bool:
+        """実行中（RUNNING かつプロセス生存）のタスクが1つでもあるか。
+        Socket Mode 連続エラー時に「再起動すると走行中の作業を巻き添えに殺す」かどうかの
+        判断に使う。タスクはサブプロセス+JSONL監視で動作し Slack socket には依存しないため、
+        接続不良中でも走り続けられる。"""
+        for project in self.projects.values():
+            for session in project.sessions.values():
+                active = session.active_task
+                if (active and active.status == TaskStatus.RUNNING
+                        and active.process and active.process.poll() is None):
+                    return True
+        return False
+
 
 def _capture_edit_diff(task: Task, tool_name: str, tool_input: dict):
     """Edit/MultiEdit ツール入力からunified diff形式の差分を生成しタスクに蓄積"""
@@ -5388,6 +5402,20 @@ def _handle_directory_selection(text: str, say, thread_ts: str) -> bool:
     return True
 
 
+def _slack_reachable(timeout: float = 3.0) -> bool:
+    """Slack に TCP 到達可能かの簡易チェック。
+    Socket Mode の連続エラー時に「回線/Slack側ダウン（再起動しても無力）」と
+    「プロセス内部状態の破損（再起動で回復しうる）」を切り分けるために使う。
+    HTTPS(443) への接続可否で判定（WebSocket も同じ回線・名前解決を通るため代理になる）。"""
+    for host in ("slack.com", "api.slack.com"):
+        try:
+            with socket.create_connection((host, 443), timeout=timeout):
+                return True
+        except OSError:
+            continue
+    return False
+
+
 # ── エントリーポイント ────────────────────────────────────
 def main():
     logger.info("=" * 55)
@@ -5580,27 +5608,45 @@ def main():
 
                 if _sm_consecutive_errors >= _SM_MAX_RETRIES:
                     elapsed = int(time.time() - _sm_disconnect_since)
-                    logger.critical(
-                        "Socket Mode で %d回連続エラー（%d秒間切断）。"
-                        "プロセスを終了し再起動します。",
-                        _sm_consecutive_errors, elapsed,
+                    # 再起動は「プロセス内部状態の破損」をクリアする最終手段。
+                    # ただし次の2ケースでは再起動が逆効果なので見送り、再接続を続ける:
+                    #   1) 回線/Slack 到達不可 → 再起動しても同じ再接続をやり直すだけで無力。
+                    #      回線復旧まで静かに待つ方がよい（プロセス churn と走行中タスク喪失を避ける）。
+                    #   2) 走行中タスクあり → 再起動は実行中の作業を巻き添えに殺す。
+                    #      タスクはサブプロセス+JSONL監視で動き Slack socket に依存しないため、
+                    #      接続不良中も走り続けられる。タスクが捌けるまで再起動を保留する。
+                    reachable = _slack_reachable()
+                    if reachable and not runner.has_running_tasks():
+                        logger.critical(
+                            "Socket Mode で %d回連続エラー（%d秒間切断）。"
+                            "回線は到達可・走行中タスク無しのため、内部状態の破損とみなし"
+                            "プロセスを終了し再起動します。",
+                            _sm_consecutive_errors, elapsed,
+                        )
+                        _macos_notify(
+                            "Claude Slack Bridge",
+                            f"接続エラーが{_sm_consecutive_errors}回連続。"
+                            "プロセスを再起動します。",
+                        )
+                        try:
+                            runner.save_sessions()
+                        except Exception:
+                            pass
+                        os._exit(1)
+                    # 再起動見送り: 理由をログし、最大バックオフで待って再接続を継続する。
+                    reason = "回線/Slack 到達不可" if not reachable else "走行中タスクあり"
+                    logger.warning(
+                        "Socket Mode で %d回連続エラー（%d秒間切断）だが、%sのため"
+                        "再起動を見送り再接続を継続します。",
+                        _sm_consecutive_errors, elapsed, reason,
                     )
-                    _macos_notify(
-                        "Claude Slack Bridge",
-                        f"接続エラーが{_sm_consecutive_errors}回連続。"
-                        "プロセスを再起動します。",
+                    time.sleep(_SM_BACKOFF_MAX)
+                else:
+                    logger.info(
+                        "Socket Mode 再接続 #%d: %.1f秒後にリトライ",
+                        _sm_consecutive_errors, delay,
                     )
-                    try:
-                        runner.save_sessions()
-                    except Exception:
-                        pass
-                    os._exit(1)
-
-                logger.info(
-                    "Socket Mode 再接続 #%d: %.1f秒後にリトライ",
-                    _sm_consecutive_errors, delay,
-                )
-                time.sleep(delay)
+                    time.sleep(delay)
 
                 try:
                     handler.client.connect_to_new_endpoint()
