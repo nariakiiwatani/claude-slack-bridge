@@ -223,7 +223,9 @@ MESSAGES: dict[str, dict[str, str]] = {
         # ── tools ──
         "tools_set": ":wrench: このセッションの次のタスクの許可ツール: `{tools}`\n続けてタスクを送信してください",
         "tool_request_message": ":wrench: 以下のツールの実行許可が必要です:\n{tools}",
+        "tool_request_message_suffix": "下のボタンで応答してください。一言コメントを添えるとClaudeに伝わります（却下時の理由付けにも使えます）。",
         "tool_request_context": ":file_folder: `{dir}`",
+        "tool_request_comment_label": "一言添える（任意）",
         "tool_request_approve_once": "一回のみ許可",
         "tool_request_approve_session": "セッション中許可",
         "tool_request_approve_project": "プロジェクト中許可",
@@ -232,6 +234,8 @@ MESSAGES: dict[str, dict[str, str]] = {
         "tool_request_approved_session": ":white_check_mark: ツール {tools} をこのセッション中許可して再実行します",
         "tool_request_approved_project": ":white_check_mark: ツール {tools} をこのプロジェクト中許可して再実行します",
         "tool_request_rejected": ":x: ツール許可リクエストをキャンセルしました",
+        "tool_request_user_comment": "ユーザーから一言: {comment}",
+        "tool_request_rejected_with_comment": ":x: ツール許可リクエストをキャンセルしました（コメントをClaudeに伝えます）",
 
         # ── prompt (Claude向けプロンプト) ──
         "prompt_attached_files": "添付ファイル:",
@@ -481,7 +485,9 @@ MESSAGES: dict[str, dict[str, str]] = {
         # ── tools ──
         "tools_set": ":wrench: Allowed tools for next task in this session: `{tools}`\nSend a task to continue",
         "tool_request_message": ":wrench: The following tools need permission to run:\n{tools}",
+        "tool_request_message_suffix": "Respond with a button below. You can optionally add a comment that will be passed to Claude (useful when cancelling, too).",
         "tool_request_context": ":file_folder: `{dir}`",
+        "tool_request_comment_label": "Add a comment (optional)",
         "tool_request_approve_once": "Allow once",
         "tool_request_approve_session": "Allow for session",
         "tool_request_approve_project": "Allow for project",
@@ -490,6 +496,8 @@ MESSAGES: dict[str, dict[str, str]] = {
         "tool_request_approved_session": ":white_check_mark: Approved {tools} for this session — retrying",
         "tool_request_approved_project": ":white_check_mark: Approved {tools} for this project — retrying",
         "tool_request_rejected": ":x: Tool permission request cancelled",
+        "tool_request_user_comment": "Comment from user: {comment}",
+        "tool_request_rejected_with_comment": ":x: Tool permission request cancelled (relaying your comment to Claude)",
 
         # ── prompt (Claude向け — 英語圏でも理解可能) ──
         "prompt_attached_files": "Attached files:",

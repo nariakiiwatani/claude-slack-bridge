@@ -2837,6 +2837,7 @@ class ClaudeCodeRunner:
         msg_text = t("tool_request_message", tools=tools_display)
         if context_line:
             msg_text += "\n" + context_line
+        msg_text += "\n" + t("tool_request_message_suffix")
         # ボタンのvalueにJSON埋め込み（セッション識別用）
         value_data = json.dumps({
             "thread_ts": session.thread_ts,
@@ -2849,6 +2850,17 @@ class ClaudeCodeRunner:
                 "text": {
                     "type": "mrkdwn",
                     "text": msg_text,
+                },
+            },
+            {
+                "type": "input",
+                "block_id": "tool_request_comment",
+                "optional": True,
+                "label": {"type": "plain_text", "text": t("tool_request_comment_label")},
+                "element": {
+                    "type": "plain_text_input",
+                    "action_id": "comment",
+                    "multiline": True,
                 },
             },
             {
@@ -3772,6 +3784,13 @@ def _handle_tool_request_action(ack, body, scope: str):
     requested_tools = value["tools"]
     user_id = body.get("user", {}).get("id", "")
 
+    # 同一メッセージ内 input ブロックの現在値（コメント、任意）
+    comment = (
+        body.get("state", {}).get("values", {})
+            .get("tool_request_comment", {}).get("comment", {})
+            .get("value") or ""
+    ).strip()
+
     project = runner.get_project(channel_id)
     session = project.sessions.get(thread_ts) if project else None
     if not session:
@@ -3786,9 +3805,11 @@ def _handle_tool_request_action(ack, body, scope: str):
     # ボタンメッセージを更新（ボタン除去）
     tools_display = ", ".join(f"`{t_}`" for t_ in requested_tools)
     if scope == "reject":
-        update_text = t("tool_request_rejected")
+        update_text = t("tool_request_rejected_with_comment") if comment else t("tool_request_rejected")
     else:
         update_text = t(f"tool_request_approved_{scope}", tools=tools_display)
+    if comment:
+        update_text += "\n> " + comment.replace("\n", "\n> ")
     try:
         slack_client.chat_update(
             channel=channel_id,
@@ -3805,9 +3826,42 @@ def _handle_tool_request_action(ack, body, scope: str):
     prev_task = session.tasks[-1] if session.tasks else None
 
     if scope == "reject":
-        # 却下: 前タスク自体は正常完了していたので white_check_mark に戻す
+        if not comment:
+            # 却下＋コメント無し: 前タスク自体は正常完了していたので white_check_mark に戻す
+            if prev_task:
+                runner._swap_task_reaction(prev_task, REACTION_COMPLETED)
+            return
+        # 却下＋コメントあり: コメントをClaudeに伝えるため --resume で再開
+        if not session.claude_session_id:
+            logger.warning("Tool request reject-with-comment: no session_id for resume thread=%s", thread_ts)
+            if prev_task:
+                runner._swap_task_reaction(prev_task, REACTION_COMPLETED)
+            return
+        prompt = t("tool_request_rejected") + "\n\n" + t("tool_request_user_comment", comment=comment)
+        task = Task(
+            id=0,
+            prompt=prompt,
+            allowed_tools=DEFAULT_ALLOWED_TOOLS,
+            user_id=user_id,
+        )
+        task.resume_session = session.claude_session_id
         if prev_task:
-            runner._swap_task_reaction(prev_task, REACTION_COMPLETED)
+            inherited_targets = list(prev_task.reaction_targets)
+            runner._swap_task_reaction(prev_task, None)
+        else:
+            inherited_targets = []
+        runner.assign_task_id(task)
+        task.reaction_targets = inherited_targets
+        runner._swap_task_reaction(task, REACTION_RECEIVED)
+        err = runner.run_task(project, session, task)
+        if err:
+            logger.warning("Tool request reject-with-comment: run_task error=%s thread=%s", err, thread_ts)
+            try:
+                slack_client.chat_postMessage(
+                    channel=channel_id, thread_ts=thread_ts, text=err,
+                )
+            except Exception as e:
+                logger.error("Tool request error post: %s", e)
         return
 
     # スコープに応じてSession/Projectにツールを記憶
@@ -3834,6 +3888,8 @@ def _handle_tool_request_action(ack, body, scope: str):
                 scope, requested_tools, combined_tools, thread_ts)
 
     prompt = t(f"tool_request_approved_{scope}", tools=tools_display)
+    if comment:
+        prompt += "\n\n" + t("tool_request_user_comment", comment=comment)
     task = Task(
         id=0,
         prompt=prompt,
