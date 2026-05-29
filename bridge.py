@@ -142,7 +142,7 @@ NOTIFICATION_CHANNEL = os.getenv("NOTIFICATION_CHANNEL", "")
 CLAUDE_CMD = os.getenv("CLAUDE_CMD", "claude")
 DEFAULT_ALLOWED_TOOLS = os.getenv(
     "DEFAULT_ALLOWED_TOOLS",
-    "Read,Write,Edit,MultiEdit,Bash(git *),TodoWrite",
+    "Read,Write,Edit,MultiEdit,Bash(git *),TaskCreate,TaskUpdate,TaskList",
 )
 
 MAX_SLACK_MSG_LENGTH = 39000  # Slack API上限は約40,000文字（JSONエスケープ込み）
