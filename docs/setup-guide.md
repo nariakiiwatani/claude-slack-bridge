@@ -122,6 +122,13 @@ The install script creates `.env` from `.env.example` and prompts for required v
 
 ---
 
+## Running on Multiple Machines
+
+To use the bridge across several machines (e.g. a Mac and Windows/WSL), give each machine its
+own Slack App and dedicated channel — see [multi-machine-setup.md](multi-machine-setup.md).
+
+---
+
 ## Service Management
 
 ```bash
@@ -275,6 +282,13 @@ cd claude-slack-bridge
    @bot in /path/to/your/project Hello! What files are in this project?
    ```
 3. botがスレッドを作成します。スレッドに返信すれば自動で続行します（`@bot` 不要）。
+
+---
+
+## 複数マシンでの運用
+
+Mac と Windows(WSL) など複数台で使い分ける場合は、マシンごとに別の Slack App と専用チャンネルを
+割り当てます。詳細は [multi-machine-setup.md](multi-machine-setup.md) を参照してください。
 
 ---
 
