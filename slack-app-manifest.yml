@@ -25,6 +25,9 @@ features:
   bot_user:
     display_name: Claude Code
     always_online: true
+  app_home:
+    home_tab_enabled: true        # App Home セッションダッシュボード
+    messages_tab_enabled: true    # fork「このDMで開く」用（不要ならオフ可）
 
 oauth_config:
   scopes:
@@ -34,6 +37,10 @@ oauth_config:
       - groups:history
       - files:read
       - files:write
+      - reactions:write           # タスク進捗リアクション
+      - im:write                  # App Home fork の確認DM
+      # - channels:manage         # App Home fork「チャンネルを作成」を使う場合のみ追加
+      # - groups:write            #   （プライベートチャンネルを作成する場合）
 
 settings:
   event_subscriptions:
@@ -41,8 +48,9 @@ settings:
       - message.channels
       - message.groups
       - app_mention
+      - app_home_opened           # App Home ダッシュボードを開く
   interactivity:
-    is_enabled: false
+    is_enabled: true              # Block Kit ボタン（ツール許可 / App Home fork）に必須
   org_deploy_enabled: false
   socket_mode_enabled: true
   token_rotation_enabled: false

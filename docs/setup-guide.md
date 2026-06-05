@@ -67,6 +67,8 @@ If you prefer to configure the Slack App manually.
    - `files:read` — Read files (for attachment downloads)
    - `files:write` — Upload files (for large results)
    - `reactions:write` — Add/remove reactions (task progress indicators)
+   - `im:write` — Open DMs (App Home fork prompts)
+   - `channels:manage` (or `groups:write`) — Only if you use the App Home fork "Create a channel" option
 
 ### 4. Configure Event Subscriptions
 
@@ -74,6 +76,13 @@ If you prefer to configure the Slack App manually.
 2. Under **Subscribe to bot events**, add:
    - `message.channels` — Public channel messages
    - `message.groups` — Private channel messages
+   - `app_home_opened` — Open the App Home dashboard
+
+### 4.5. Enable App Home
+
+1. Left menu: **App Home**
+2. Turn on **Home Tab**
+3. (Optional) Turn off **Messages Tab** if you do not use bot DMs — but keep it on if you want the fork "Open in this DM" option to work.
 
 ### 5. Install App
 
@@ -230,6 +239,8 @@ Slack Appを手動で設定したい場合。
    - `files:read` — ファイル読み取り（添付ファイルダウンロード用）
    - `files:write` — ファイル送信（結果が大きい場合用）
    - `reactions:write` — リアクション付与/除去（タスク進捗の可視化）
+   - `im:write` — DMを開く（App Home の fork 確認用）
+   - `channels:manage`（または `groups:write`）— App Home の fork で「チャンネルを作成」を使う場合のみ
 
 ### 4. Event Subscriptions を設定
 
@@ -237,6 +248,13 @@ Slack Appを手動で設定したい場合。
 2. **Subscribe to bot events** に以下を追加:
    - `message.channels` — パブリックチャンネルのメッセージ
    - `message.groups` — プライベートチャンネルのメッセージ
+   - `app_home_opened` — App Home ダッシュボードを開く
+
+### 4.5. App Home を有効化
+
+1. 左メニュー **App Home**
+2. **Home Tab** をオンにする
+3. （任意）bot へのDMを使わない場合は **Messages Tab** をオフにしてもよい。ただし fork の「このDMで開く」を使うならオンのままにする。
 
 ### 5. アプリをインストール
 

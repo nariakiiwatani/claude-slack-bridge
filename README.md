@@ -12,6 +12,7 @@ Invite the bot to a Slack channel and send tasks with `@bot` mentions, specifyin
 - Receive completion notifications for long-running tasks on mobile
 - Submit tasks on the go when an idea strikes
 - Share a single Mac's Claude Code with team members
+- See all sessions at a glance in the **App Home dashboard** (running + finished, across channels), including terminal Claude processes you can fork with one tap
 
 ## Security Notice
 

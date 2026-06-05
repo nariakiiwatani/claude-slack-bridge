@@ -15,6 +15,9 @@ directory_history.json
 # Session persistence
 sessions.json
 
+# App Home dashboard: finished session history
+session_history.json
+
 # Interrupted tasks live snapshot
 interrupted_tasks.json
 

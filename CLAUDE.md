@@ -77,6 +77,8 @@ Main logic is in `bridge.py`. Internationalization is in `i18n.py` (bilingual ja
 
 - **Bare task** — When `@bot <task>` is sent without `in` or `fork`, `_handle_bare_task` shows fork candidates and directory history for selection. Selection state is stored in `pending_directory_requests`.
 
+- **App Home dashboard** — The Bot's App Home tab shows a cross-channel session dashboard (`_build_home_view` → `views.publish`). Unit is the **session** (each row shows the latest task's state). Three categories: ① running bridge-managed sessions (`runner.projects` → `active_sessions`), ② running external/terminal Claude processes (`detect_running_claude_instances()`, excluding tracked PIDs and bridge descendants), and ③ finished sessions from `session_history.json` (latest 100, displayed up to `SESSION_HISTORY_DISPLAY`). `_collect_dashboard_sessions()` does the cross-channel collection. A per-viewer **Mine/Everyone toggle** (`home_toggle_scope`) re-publishes filtered by `task.user_id` (App Home has no custom tabs, so this is an in-view toggle). External processes are always shown (no Slack owner) and carry a **fork button** (`home_fork`): it resolves a target channel by matching the process cwd against channel roots / existing session `working_dir` (`_find_channel_for_cwd`); if none matches, it DMs the user a 2-choice (`home_fork_create_channel` via `conversations.create` / `home_fork_use_dm`). `session_history.json` is a thin per-session record written in `_execute`'s `finally` (`record_session_history`), independent of volatile Task objects, so finished sessions survive restarts. Updates: `app_home_opened` publishes immediately; `_schedule_home_refresh()` re-publishes recently-active viewers on task start/finish; `_app_home_poll_loop` re-publishes every `APP_HOME_POLL_INTERVAL`s while any session is running. Requires the Home Tab feature + `app_home_opened` subscription; the fork "create channel" path additionally needs the `channels:manage` (or `groups:write`) scope.
+
 ### Data Flow
 
 1. Message event arrives via Socket Mode → `handle_message` routes by `channel_type`
@@ -95,6 +97,7 @@ Thread replies to a session's Slack thread automatically create new tasks with `
 - `directory_history.json` — Per-channel directory usage history (channel_id → [dir_path, ...]). Max 10 entries per channel.
 - `sessions.json` — Per-channel session data (claude_session_id, working_dir, label, etc.). Restored on bridge restart for `--resume` continuity. Unloaded channels' data is preserved across saves. Expired sessions (>7 days) are pruned. Max 50 sessions per channel.
 - `channel_roots.json` — Per-channel root directory settings (channel_id → path). Used by `root` command. Bare tasks in channels with a root set run immediately in that directory.
+- `session_history.json` — Thin records of finished sessions for the App Home dashboard (latest task's status/prompt/dir/user/timestamps/tool_count per thread). Global cap of 100 (`SESSION_HISTORY_MAX`). Written on session completion; survives restart (Task objects do not).
 - Tasks are volatile (in-memory only, lost on bridge restart).
 
 ## Language

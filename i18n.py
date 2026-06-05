@@ -267,6 +267,37 @@ MESSAGES: dict[str, dict[str, str]] = {
             "WebFetchによるダウンロードなど）は、手動実行を提案するのではなく、"
             "必ず [TOOL_REQUEST:ツール名] マーカーを出力してください。"
         ),
+
+        # ── App Home ダッシュボード ──
+        "home_title": ":satellite_antenna: Claude セッションダッシュボード",
+        "home_subtitle": "表示: {scope}  ·  更新 {updated}",
+        "home_scope_mine": "自分のみ",
+        "home_scope_all": "全員",
+        "home_toggle_to_all": ":busts_in_silhouette: 全員を表示",
+        "home_toggle_to_mine": ":bust_in_silhouette: 自分のみ表示",
+        "home_refresh_button": ":arrows_counterclockwise: 更新",
+        "home_section_running": ":gear: *進行中（ブリッジ管理） — {count}*",
+        "home_section_external": ":computer: *進行中（ターミナル / 外部） — {count}*",
+        "home_section_finished": ":checkered_flag: *終了済み — {count}*",
+        "home_none": "_なし_",
+        "home_more": "_他 {count} 件_",
+        "home_open_thread": ":speech_balloon: スレッドを開く",
+        "home_truncated": "_…表示上限に達したため一部を省略しました_",
+        "home_fork_button": "fork",
+        "home_not_allowed": ":lock: このダッシュボードを表示する権限がありません。",
+        "home_dur_sec": "{n}秒",
+        "home_dur_min": "{n}分",
+        "home_dur_hour": "{n}時間{m}分",
+        "home_fork_thread_header": ":fork_and_knife: 外部セッションを取り込みました（cwd: `{cwd}`）。このスレッドに返信すると続きから実行します。",
+        "home_fork_failed": ":x: fork に失敗しました。",
+        "home_fork_no_channel": (
+            ":mag: cwd `{cwd}` に対応するチャンネルが見つかりませんでした。\n"
+            "取り込み先を選んでください。"
+        ),
+        "home_fork_create_channel": ":heavy_plus_sign: チャンネルを作成",
+        "home_fork_use_dm": ":speech_balloon: このDMで開く",
+        "home_fork_creating": ":hourglass_flowing_sand: チャンネルを作成しています…",
+        "home_fork_opening_dm": ":hourglass_flowing_sand: DMで開いています…",
     },
     "en": {
         # ── help ──
@@ -530,6 +561,37 @@ MESSAGES: dict[str, dict[str, str]] = {
             "WebFetch for downloading, etc.), do NOT suggest manual execution. "
             "Instead, ALWAYS output a [TOOL_REQUEST:ToolName] marker."
         ),
+
+        # ── App Home dashboard ──
+        "home_title": ":satellite_antenna: Claude Session Dashboard",
+        "home_subtitle": "View: {scope}  ·  updated {updated}",
+        "home_scope_mine": "Mine",
+        "home_scope_all": "Everyone",
+        "home_toggle_to_all": ":busts_in_silhouette: Show everyone",
+        "home_toggle_to_mine": ":bust_in_silhouette: Show mine only",
+        "home_refresh_button": ":arrows_counterclockwise: Refresh",
+        "home_section_running": ":gear: *Running (bridge) — {count}*",
+        "home_section_external": ":computer: *Running (terminal / external) — {count}*",
+        "home_section_finished": ":checkered_flag: *Finished — {count}*",
+        "home_none": "_none_",
+        "home_more": "_{count} more_",
+        "home_open_thread": ":speech_balloon: Open thread",
+        "home_truncated": "_…truncated to fit the display limit_",
+        "home_fork_button": "fork",
+        "home_not_allowed": ":lock: You are not allowed to view this dashboard.",
+        "home_dur_sec": "{n}s",
+        "home_dur_min": "{n}m",
+        "home_dur_hour": "{n}h{m}m",
+        "home_fork_thread_header": ":fork_and_knife: Imported the external session (cwd: `{cwd}`). Reply in this thread to continue.",
+        "home_fork_failed": ":x: Fork failed.",
+        "home_fork_no_channel": (
+            ":mag: No channel matching cwd `{cwd}` was found.\n"
+            "Choose where to import it."
+        ),
+        "home_fork_create_channel": ":heavy_plus_sign: Create a channel",
+        "home_fork_use_dm": ":speech_balloon: Open in this DM",
+        "home_fork_creating": ":hourglass_flowing_sand: Creating a channel…",
+        "home_fork_opening_dm": ":hourglass_flowing_sand: Opening in DM…",
     },
 }
 

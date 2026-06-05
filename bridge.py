@@ -158,6 +158,13 @@ SESSIONS_MAX_PER_CHANNEL = 50
 # タスク開始/終了時にライブ書き換え。次回起動時に残っているエントリ = 中断タスク。
 INTERRUPTED_TASKS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "interrupted_tasks.json")
 
+# App Home ダッシュボード — 終了済みセッションの薄い履歴（再起動後も保持）
+SESSION_HISTORY_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "session_history.json")
+SESSION_HISTORY_MAX = 100        # 全体で保持する終了済みセッションの最大件数
+SESSION_HISTORY_DISPLAY = 30     # Home ビューに表示する終了済みセッションの最大件数
+APP_HOME_POLL_INTERVAL = 30      # 進行中セッションがある間の再 publish 間隔（秒）
+APP_HOME_VIEWER_TTL = 600        # app_home_opened を最後に受けてから再 publish 対象とみなす猶予（秒）
+
 # Team Agent用追加ツール
 TEAM_EXTRA_TOOLS = "TeamCreate,TeamDelete,SendMessage,TaskCreate,TaskUpdate,TaskList,Agent"
 
@@ -477,6 +484,15 @@ def _build_reaction_targets(channel_id: str,
     if thread_ts and thread_ts != request_msg_ts:
         targets.append((channel_id, thread_ts))
     return targets
+
+
+def _task_anchor_ts(task: "Task") -> Optional[str]:
+    """タスクの基点メッセージ ts（= ユーザー指示メッセージ）を返す。
+    App Home のリンクをスレッド先頭ではなく最新タスクへ向けるために使う。"""
+    if task and task.reaction_targets:
+        # 先頭 = (channel_id, ユーザー指示メッセージ ts)
+        return task.reaction_targets[0][1]
+    return None
 
 
 # ── データ構造（3層モデル: Project → Session → Task） ────
@@ -1918,6 +1934,9 @@ class ClaudeCodeRunner:
         # 進行中タスクのライブスナップショット（中断検出用）
         self._interrupted_lock = threading.Lock()
         self._active_tasks_snapshot: list[dict] = []
+        # App Home ダッシュボード用: 終了済みセッションの薄い履歴
+        self._session_history_lock = threading.Lock()
+        self._session_history: list[dict] = self.load_session_history()
 
     def _next_id(self) -> int:
         self._task_counter += 1
@@ -2183,6 +2202,70 @@ class ClaudeCodeRunner:
             logger.warning("Failed to load sessions: %s", e)
             return {}
 
+    # ── App Home ダッシュボード用: 終了済みセッション履歴 ──
+    def load_session_history(self) -> list[dict]:
+        """session_history.json を読み込み（薄い終了済みセッション記録のリスト）"""
+        try:
+            with open(SESSION_HISTORY_FILE, "r") as f:
+                data = json.load(f)
+            return data if isinstance(data, list) else []
+        except (FileNotFoundError, json.JSONDecodeError):
+            return []
+        except Exception as e:
+            logger.warning("Failed to load session history: %s", e)
+            return []
+
+    def _save_session_history_locked(self):
+        """_session_history_lock 取得済み前提で atomic 書き出し。"""
+        try:
+            dir_name = os.path.dirname(SESSION_HISTORY_FILE)
+            fd, tmp_path = tempfile.mkstemp(dir=dir_name, suffix=".tmp")
+            try:
+                with os.fdopen(fd, "w") as f:
+                    json.dump(self._session_history, f, ensure_ascii=False, indent=2)
+                os.replace(tmp_path, SESSION_HISTORY_FILE)
+            except BaseException:
+                os.unlink(tmp_path)
+                raise
+        except Exception as e:
+            logger.warning("Failed to save session history: %s", e)
+
+    def record_session_history(self, session: "Session", task: "Task"):
+        """セッションの最新タスク終了時に薄い履歴レコードを追記。
+        同一スレッドの既存レコードは置き換える（セッション=最新タスクのみ保持）。"""
+        status = task.status.value if task.status else "unknown"
+        entry = {
+            "channel_id": session.channel_id,
+            "thread_ts": session.thread_ts,
+            "latest_msg_ts": _task_anchor_ts(task),
+            "session_id": session.claude_session_id,
+            "label_emoji": session.label_emoji,
+            "label_name": session.label_name,
+            "working_dir": session.working_dir,
+            "user_id": task.user_id,
+            "latest_status": status,
+            "latest_prompt": (task.prompt or "")[:200],
+            "started_at": task.started_at.isoformat() if task.started_at else None,
+            "completed_at": task.completed_at.isoformat() if task.completed_at else None,
+            "tool_count": len(task.tool_calls),
+        }
+        key = (session.channel_id, session.thread_ts)
+        with self._session_history_lock:
+            self._session_history = [
+                e for e in self._session_history
+                if (e.get("channel_id"), e.get("thread_ts")) != key
+            ]
+            self._session_history.append(entry)
+            # 全体上限（末尾が最新なので先頭=古いものを削る）
+            if len(self._session_history) > SESSION_HISTORY_MAX:
+                self._session_history = self._session_history[-SESSION_HISTORY_MAX:]
+            self._save_session_history_locked()
+
+    def get_session_history(self) -> list[dict]:
+        """終了済みセッション履歴のコピーを新しい順で返す。"""
+        with self._session_history_lock:
+            return list(reversed(self._session_history))
+
     @staticmethod
     def _migrate_prompts(sdata: dict) -> list[str]:
         """旧形式 (first_prompt/latest_prompt) から prompts リストへマイグレーション"""
@@ -2314,6 +2397,8 @@ class ClaudeCodeRunner:
             target=self._execute, args=(project, session, task), daemon=True
         )
         thread.start()
+        # App Home ダッシュボード: 開始を即時反映
+        _schedule_home_refresh()
         return None
 
     def _execute(self, project: Project, session: Session, task: Task):
@@ -2587,6 +2672,12 @@ class ClaudeCodeRunner:
             # 進行中タスクスナップショットから除去
             # （プロセスがここまで生きていれば「中断」ではないので)
             self.clear_active_task(session)
+            # App Home ダッシュボード: 終了済みセッション履歴を記録し即時更新
+            try:
+                self.record_session_history(session, task)
+            except Exception as e:
+                logger.warning("record_session_history failed: %s", e)
+            _schedule_home_refresh()
 
     def _format_result(self, task: Task, session: Session, elapsed: float,
                        show_result: bool = True) -> tuple[str, list[dict], str | None]:
@@ -3958,10 +4049,534 @@ def _help_text() -> str:
     return t("help_text")
 
 
-def _slack_thread_link(channel_id: str, thread_ts: str) -> str:
-    """Slackスレッドへのリンクを生成"""
+def _slack_thread_link(channel_id: str, thread_ts: str,
+                       msg_ts: Optional[str] = None) -> str:
+    """Slackスレッドへのリンクを生成。
+    msg_ts を指定するとスレッド内の該当メッセージ（最新タスク等）へディープリンクする。"""
+    if msg_ts and msg_ts != thread_ts:
+        ts_no_dot = msg_ts.replace(".", "")
+        return (f"https://app.slack.com/archives/{channel_id}/p{ts_no_dot}"
+                f"?thread_ts={thread_ts}&cid={channel_id}")
     ts_no_dot = thread_ts.replace(".", "")
     return f"https://app.slack.com/archives/{channel_id}/p{ts_no_dot}"
+
+
+# ─────────────────────────────────────────────────────────────────────────
+# App Home ダッシュボード
+#   - whitelist内全チャンネル + Mac上の外部Claudeを横断したセッション一覧
+#   - 進行中(ブリッジ管理/外部) + 終了済み(session_history) を表示
+#   - 「自分のみ / 全員」トグル、外部プロセスの fork ボタン
+# ─────────────────────────────────────────────────────────────────────────
+
+# 最近ホームを開いた viewer の状態: user_id -> {"last": datetime, "show_all": bool}
+_home_viewers: dict[str, dict] = {}
+_home_viewers_lock = threading.Lock()
+
+_FINISHED_STATUS_EMOJI = {
+    "completed": ":white_check_mark:",
+    "failed": ":x:",
+    "cancelled": ":stop_sign:",
+}
+
+
+def _dash_truncate(text: str, n: int) -> str:
+    text = (text or "").replace("\n", " ").strip()
+    return text[:n] + ("…" if len(text) > n else "")
+
+
+def _fmt_duration(seconds: float) -> str:
+    """経過秒数を簡潔な日本語/英語表記に整形。"""
+    seconds = int(max(0, seconds))
+    if seconds < 90:
+        return t("home_dur_sec", n=seconds)
+    mins = seconds // 60
+    if mins < 90:
+        return t("home_dur_min", n=mins)
+    hours = mins // 60
+    return t("home_dur_hour", n=hours, m=mins % 60)
+
+
+def _fmt_completed_at(iso_str: Optional[str]) -> str:
+    if not iso_str:
+        return ""
+    try:
+        dt = datetime.fromisoformat(iso_str)
+    except (ValueError, TypeError):
+        return ""
+    return dt.strftime("%m/%d %H:%M")
+
+
+def _collect_dashboard_sessions() -> dict:
+    """ダッシュボード表示用にセッション情報を横断収集。
+    返す: {"running_bridge": [...], "running_external": [...], "finished": [...]}"""
+    running_bridge: list[dict] = []
+    active_thread_keys: set[tuple] = set()
+    for channel_id, project in list(runner.projects.items()):
+        for session in project.active_sessions:
+            task = session.active_task
+            if not task:
+                continue
+            active_thread_keys.add((channel_id, session.thread_ts))
+            elapsed = (datetime.now() - task.started_at).total_seconds() if task.started_at else 0
+            running_bridge.append({
+                "channel_id": channel_id,
+                "thread_ts": session.thread_ts,
+                "anchor_ts": _task_anchor_ts(task),
+                "label_emoji": session.label_emoji,
+                "label_name": session.label_name,
+                "working_dir": session.working_dir,
+                "user_id": task.user_id,
+                "prompt": task.prompt or "",
+                "elapsed": elapsed,
+                "tool_count": len(task.tool_calls),
+                "recent_tools": [tc["name"] for tc in task.tool_calls[-3:]],
+            })
+
+    # 外部プロセス（ブリッジ管轄外で今生きているもの）
+    running_external: list[dict] = []
+    try:
+        instances = detect_running_claude_instances()
+    except Exception as e:
+        logger.warning("dashboard: detect instances failed: %s", e)
+        instances = []
+    tracked_pids = {d.get("pid") for d in instance_threads.values() if d.get("pid")}
+    for ext in instances:
+        pid = ext.get("pid")
+        if pid in tracked_pids:
+            continue
+        try:
+            if _is_descendant_of_bridge(pid):
+                continue
+        except Exception:
+            pass
+        running_external.append({"pid": pid, "cwd": ext.get("cwd"), "etime": ext.get("etime")})
+
+    # 終了済み（現在アクティブなスレッドは進行中側で表示するため除外）
+    finished: list[dict] = []
+    for entry in runner.get_session_history():
+        key = (entry.get("channel_id"), entry.get("thread_ts"))
+        if key in active_thread_keys:
+            continue
+        finished.append(entry)
+
+    return {
+        "running_bridge": running_bridge,
+        "running_external": running_external,
+        "finished": finished,
+    }
+
+
+def _build_home_view(viewer_user_id: str, show_all: bool) -> dict:
+    """Block Kit の Home ビューを構築。show_all=False なら viewer 本人のセッションのみ。"""
+    data = _collect_dashboard_sessions()
+    running_bridge = data["running_bridge"]
+    running_external = data["running_external"]
+    finished = data["finished"]
+
+    if not show_all:
+        running_bridge = [s for s in running_bridge if s["user_id"] == viewer_user_id]
+        finished = [s for s in finished if s.get("user_id") == viewer_user_id]
+    # 外部プロセスは所有者を特定できないため常に表示
+
+    blocks: list[dict] = []
+    blocks.append({
+        "type": "header",
+        "text": {"type": "plain_text", "text": t("home_title"), "emoji": True},
+    })
+    scope_label = t("home_scope_all") if show_all else t("home_scope_mine")
+    blocks.append({
+        "type": "context",
+        "elements": [{"type": "mrkdwn",
+                      "text": t("home_subtitle", scope=scope_label,
+                                updated=datetime.now().strftime("%H:%M:%S"))}],
+    })
+    toggle_label = t("home_toggle_to_mine") if show_all else t("home_toggle_to_all")
+    blocks.append({
+        "type": "actions",
+        "elements": [
+            {"type": "button",
+             "text": {"type": "plain_text", "text": toggle_label, "emoji": True},
+             "action_id": "home_toggle_scope",
+             "value": "mine" if show_all else "all"},
+            {"type": "button",
+             "text": {"type": "plain_text", "text": t("home_refresh_button"), "emoji": True},
+             "action_id": "home_refresh"},
+        ],
+    })
+    blocks.append({"type": "divider"})
+
+    # 進行中（ブリッジ管理）
+    blocks.append({
+        "type": "section",
+        "text": {"type": "mrkdwn", "text": t("home_section_running", count=len(running_bridge))},
+    })
+    if running_bridge:
+        for s in running_bridge[:20]:
+            link = _slack_thread_link(s["channel_id"], s["thread_ts"], s.get("anchor_ts"))
+            dir_name = os.path.basename(s["working_dir"]) if s["working_dir"] else "?"
+            user_field = f"<@{s['user_id']}>" if s["user_id"] else "-"
+            recent = " → ".join(f"`{n}`" for n in s["recent_tools"]) if s["recent_tools"] else "-"
+            blocks.append({
+                "type": "section",
+                "text": {"type": "mrkdwn",
+                         "text": f"{s['label_emoji']} <{link}|{t('home_open_thread')}>  "
+                                 f"_{_dash_truncate(s['prompt'], 80)}_"},
+                "fields": [
+                    {"type": "mrkdwn", "text": f"*Dir:* `{dir_name}`"},
+                    {"type": "mrkdwn", "text": f"*User:* {user_field}"},
+                    {"type": "mrkdwn", "text": f"*Time:* {_fmt_duration(s['elapsed'])}"},
+                    {"type": "mrkdwn", "text": f"*Tools:* {s['tool_count']}  {recent}"},
+                ],
+            })
+        if len(running_bridge) > 20:
+            blocks.append({"type": "context", "elements": [
+                {"type": "mrkdwn", "text": t("home_more", count=len(running_bridge) - 20)}]})
+    else:
+        blocks.append({"type": "context", "elements": [
+            {"type": "mrkdwn", "text": t("home_none")}]})
+
+    # 進行中（外部 / ターミナル）
+    if running_external:
+        blocks.append({"type": "divider"})
+        blocks.append({
+            "type": "section",
+            "text": {"type": "mrkdwn", "text": t("home_section_external", count=len(running_external))},
+        })
+        for ext in running_external[:20]:
+            cwd = ext.get("cwd") or "(unknown)"
+            blocks.append({
+                "type": "section",
+                "text": {"type": "mrkdwn",
+                         "text": f":computer: PID `{ext['pid']}`  :file_folder: `{cwd}`  "
+                                 f":clock1: {ext.get('etime') or '?'}"},
+                "accessory": {
+                    "type": "button",
+                    "text": {"type": "plain_text", "text": t("home_fork_button"), "emoji": True},
+                    "action_id": "home_fork",
+                    "value": json.dumps({"pid": ext["pid"], "cwd": cwd}),
+                },
+            })
+        if len(running_external) > 20:
+            blocks.append({"type": "context", "elements": [
+                {"type": "mrkdwn", "text": t("home_more", count=len(running_external) - 20)}]})
+
+    # 終了済み
+    blocks.append({"type": "divider"})
+    blocks.append({
+        "type": "section",
+        "text": {"type": "mrkdwn", "text": t("home_section_finished", count=len(finished))},
+    })
+    if finished:
+        for e in finished[:SESSION_HISTORY_DISPLAY]:
+            emoji = _FINISHED_STATUS_EMOJI.get(e.get("latest_status"), ":grey_question:")
+            link = _slack_thread_link(e["channel_id"], e["thread_ts"], e.get("latest_msg_ts"))
+            dir_name = os.path.basename(e["working_dir"]) if e.get("working_dir") else "?"
+            when = _fmt_completed_at(e.get("completed_at"))
+            label = e.get("label_emoji") or ""
+            # section ブロックにして、進行中と同様にスレッドへ明確にジャンプできるようにする
+            blocks.append({
+                "type": "section",
+                "text": {"type": "mrkdwn",
+                         "text": f"{emoji} {label} <{link}|{t('home_open_thread')}>  "
+                                 f":file_folder:`{dir_name}` "
+                                 f"_{_dash_truncate(e.get('latest_prompt', ''), 60)}_ "
+                                 f"· {when}"},
+            })
+        if len(finished) > SESSION_HISTORY_DISPLAY:
+            blocks.append({"type": "context", "elements": [
+                {"type": "mrkdwn", "text": t("home_more", count=len(finished) - SESSION_HISTORY_DISPLAY)}]})
+    else:
+        blocks.append({"type": "context", "elements": [
+            {"type": "mrkdwn", "text": t("home_none")}]})
+
+    # Slack の Home ビューは最大100ブロック。安全側で丸める。
+    if len(blocks) > 98:
+        blocks = blocks[:97]
+        blocks.append({"type": "context", "elements": [
+            {"type": "mrkdwn", "text": t("home_truncated")}]})
+
+    return {"type": "home", "blocks": blocks}
+
+
+def _build_home_denied_view() -> dict:
+    return {"type": "home", "blocks": [
+        {"type": "section", "text": {"type": "mrkdwn", "text": t("home_not_allowed")}},
+    ]}
+
+
+# ── viewer 登録 / publish / 更新 ──
+def _get_viewer_scope(user_id: str) -> bool:
+    with _home_viewers_lock:
+        v = _home_viewers.get(user_id)
+        return bool(v and v.get("show_all"))
+
+
+def _note_home_viewer(user_id: str, show_all: bool):
+    with _home_viewers_lock:
+        _home_viewers[user_id] = {"last": datetime.now(), "show_all": show_all}
+
+
+def _publish_home(user_id: str, show_all: bool = False):
+    try:
+        view = _build_home_view(user_id, show_all)
+        slack_client.views_publish(user_id=user_id, view=view)
+    except Exception as e:
+        logger.warning("views_publish failed user=%s: %s", user_id, e)
+
+
+def _refresh_home_viewers():
+    """最近ホームを開いた viewer 全員に再 publish。"""
+    now = datetime.now()
+    with _home_viewers_lock:
+        viewers = [(uid, v.get("show_all", False))
+                   for uid, v in _home_viewers.items()
+                   if (now - v["last"]).total_seconds() <= APP_HOME_VIEWER_TTL]
+    for uid, show_all in viewers:
+        _publish_home(uid, show_all)
+
+
+def _schedule_home_refresh():
+    """進行中の変化を反映するため近接 viewer を非同期で再 publish（即時更新フック）。"""
+    threading.Thread(target=_refresh_home_viewers, daemon=True).start()
+
+
+def _has_running_sessions() -> bool:
+    for project in list(runner.projects.values()):
+        if project.active_sessions:
+            return True
+    return False
+
+
+def _app_home_poll_loop():
+    """進行中セッションがある間だけ定期的に viewer を再 publish。"""
+    while True:
+        try:
+            time.sleep(APP_HOME_POLL_INTERVAL)
+            if _has_running_sessions():
+                _refresh_home_viewers()
+        except Exception as e:
+            logger.warning("app_home poll loop error: %s", e)
+
+
+# ── 外部プロセスの fork（App Home から） ──
+def _open_im(user_id: str) -> Optional[str]:
+    try:
+        resp = slack_client.conversations_open(users=user_id)
+        return resp["channel"]["id"]
+    except Exception as e:
+        logger.warning("conversations_open failed user=%s: %s", user_id, e)
+        return None
+
+
+def _dm_user(user_id: str, text: str, blocks: Optional[list] = None):
+    ch = _open_im(user_id)
+    if not ch:
+        return
+    try:
+        slack_client.chat_postMessage(channel=ch, text=text, blocks=blocks or None)
+    except Exception as e:
+        logger.warning("dm user failed user=%s: %s", user_id, e)
+
+
+def _remove_action_buttons(body: dict, text: str):
+    """ボタン押下元メッセージ（DM等）からボタンを除去。"""
+    try:
+        ch = body.get("channel", {}).get("id")
+        ts = body.get("message", {}).get("ts")
+        if ch and ts:
+            slack_client.chat_update(channel=ch, ts=ts, text=text, blocks=[])
+    except Exception as e:
+        logger.warning("remove action buttons failed: %s", e)
+
+
+def _find_channel_for_cwd(cwd: str) -> Optional[str]:
+    """working_dir(=cwd) が一致するチャンネルを探す。channel root 優先、なければ既存セッション。"""
+    target = os.path.normpath(cwd)
+    try:
+        roots = runner.load_channel_roots()
+    except Exception:
+        roots = {}
+    for cid, root in roots.items():
+        if root and os.path.normpath(root) == target:
+            return cid
+    for cid, project in list(runner.projects.items()):
+        for s in project.sessions.values():
+            if s.working_dir and os.path.normpath(s.working_dir) == target:
+                return cid
+    return None
+
+
+def _sanitize_channel_name(name: str) -> str:
+    name = name.lower()
+    name = re.sub(r"[^a-z0-9_-]+", "-", name)
+    name = re.sub(r"-+", "-", name).strip("-")
+    return name[:80] or "claude-session"
+
+
+def _create_channel_for_cwd(cwd: str, user_id: str) -> Optional[str]:
+    """cwd 用の新規チャンネルを作成し、root を cwd に設定して channel_id を返す。"""
+    base = os.path.basename(os.path.normpath(cwd)) or "session"
+    name = _sanitize_channel_name(f"claude-{base}")
+    try:
+        resp = slack_client.conversations_create(name=name)
+        channel_id = resp["channel"]["id"]
+    except Exception as e:
+        logger.warning("conversations_create failed name=%s: %s", name, e)
+        return None
+    try:
+        slack_client.conversations_invite(channel=channel_id, users=user_id)
+    except Exception as e:
+        logger.info("conversations_invite skipped/failed channel=%s: %s", channel_id, e)
+    # cwd をチャンネル root に設定して永続化
+    try:
+        project = runner.get_or_create_project(channel_id)
+        project.root_dir = cwd
+        runner.save_channel_roots()
+    except Exception as e:
+        logger.warning("set channel root failed channel=%s: %s", channel_id, e)
+    return channel_id
+
+
+def _fork_into_channel(pid: int, cwd: str, channel_id: str, user_id: str):
+    """指定チャンネルに新規スレッドを作って外部プロセスを取り込む（pending_fork で待機）。"""
+    try:
+        parent = slack_client.chat_postMessage(
+            channel=channel_id, text=t("home_fork_thread_header", cwd=cwd))
+    except Exception as e:
+        logger.warning("fork into channel post failed channel=%s: %s", channel_id, e)
+        _dm_user(user_id, t("home_fork_failed"))
+        return
+    thread_ts = parent["ts"]
+
+    def _say(**kwargs):
+        kwargs.setdefault("channel", channel_id)
+        try:
+            return slack_client.chat_postMessage(**kwargs)
+        except Exception as e:
+            logger.warning("fork say failed: %s", e)
+
+    _execute_fork({"pid": pid, "cwd": cwd}, channel_id, _say, thread_ts, user_id,
+                  initial_input=None)
+    _schedule_home_refresh()
+
+
+def _home_fork_external(pid: int, cwd: str, user_id: str):
+    if not _is_process_alive(pid):
+        _dm_user(user_id, t("fork_pid_exited", pid=pid))
+        _publish_home(user_id, _get_viewer_scope(user_id))
+        return
+    channel_id = _find_channel_for_cwd(cwd)
+    if channel_id:
+        _fork_into_channel(pid, cwd, channel_id, user_id)
+        return
+    # 一致するチャンネルがない → 「作成 / DM」の2択を DM で提示
+    val = json.dumps({"pid": pid, "cwd": cwd})
+    blocks = [
+        {"type": "section",
+         "text": {"type": "mrkdwn", "text": t("home_fork_no_channel", cwd=cwd)}},
+        {"type": "actions", "elements": [
+            {"type": "button", "style": "primary",
+             "text": {"type": "plain_text", "text": t("home_fork_create_channel"), "emoji": True},
+             "action_id": "home_fork_create_channel", "value": val},
+            {"type": "button",
+             "text": {"type": "plain_text", "text": t("home_fork_use_dm"), "emoji": True},
+             "action_id": "home_fork_use_dm", "value": val},
+        ]},
+    ]
+    _dm_user(user_id, t("home_fork_no_channel", cwd=cwd), blocks)
+
+
+# ── App Home イベント / アクション ハンドラ ──
+@app.event("app_home_opened")
+def handle_app_home_opened(event):
+    if event.get("tab") != "home":
+        return
+    user_id = event.get("user")
+    if not user_id:
+        return
+    if not _is_user_allowed(user_id):
+        try:
+            slack_client.views_publish(user_id=user_id, view=_build_home_denied_view())
+        except Exception:
+            pass
+        return
+    show_all = _get_viewer_scope(user_id)
+    _note_home_viewer(user_id, show_all)
+    _publish_home(user_id, show_all)
+
+
+@app.action("home_toggle_scope")
+def handle_home_toggle_scope(ack, body):
+    ack()
+    user_id = body.get("user", {}).get("id")
+    if not user_id:
+        return
+    new_scope = body["actions"][0].get("value") == "all"
+    _note_home_viewer(user_id, new_scope)
+    _publish_home(user_id, new_scope)
+
+
+@app.action("home_refresh")
+def handle_home_refresh(ack, body):
+    ack()
+    user_id = body.get("user", {}).get("id")
+    if not user_id:
+        return
+    show_all = _get_viewer_scope(user_id)
+    _note_home_viewer(user_id, show_all)
+    _publish_home(user_id, show_all)
+
+
+@app.action("home_fork")
+def handle_home_fork(ack, body):
+    ack()
+    user_id = body.get("user", {}).get("id")
+    if not user_id or not _is_user_allowed(user_id):
+        return
+    try:
+        val = json.loads(body["actions"][0]["value"])
+    except (json.JSONDecodeError, KeyError, IndexError):
+        return
+    _home_fork_external(val.get("pid"), val.get("cwd"), user_id)
+
+
+@app.action("home_fork_create_channel")
+def handle_home_fork_create_channel(ack, body):
+    ack()
+    user_id = body.get("user", {}).get("id")
+    if not user_id or not _is_user_allowed(user_id):
+        return
+    try:
+        val = json.loads(body["actions"][0]["value"])
+    except (json.JSONDecodeError, KeyError, IndexError):
+        return
+    pid, cwd = val.get("pid"), val.get("cwd")
+    _remove_action_buttons(body, t("home_fork_creating"))
+    channel_id = _create_channel_for_cwd(cwd, user_id)
+    if not channel_id:
+        # 作成失敗 → DM へフォールバック
+        im = _open_im(user_id)
+        if im:
+            _fork_into_channel(pid, cwd, im, user_id)
+        return
+    _fork_into_channel(pid, cwd, channel_id, user_id)
+
+
+@app.action("home_fork_use_dm")
+def handle_home_fork_use_dm(ack, body):
+    ack()
+    user_id = body.get("user", {}).get("id")
+    if not user_id or not _is_user_allowed(user_id):
+        return
+    try:
+        val = json.loads(body["actions"][0]["value"])
+    except (json.JSONDecodeError, KeyError, IndexError):
+        return
+    pid, cwd = val.get("pid"), val.get("cwd")
+    _remove_action_buttons(body, t("home_fork_opening_dm"))
+    im = _open_im(user_id)
+    if im:
+        _fork_into_channel(pid, cwd, im, user_id)
 
 
 def _handle_status(say, thread_ts, channel_id: str):
@@ -5737,6 +6352,10 @@ def main():
     # アイドルセッション外部テイクオーバー監視スレッド起動
     idle_monitor = threading.Thread(target=_idle_takeover_monitor_loop, daemon=True)
     idle_monitor.start()
+
+    # App Home ダッシュボードの定期更新スレッド起動
+    home_poll = threading.Thread(target=_app_home_poll_loop, daemon=True)
+    home_poll.start()
 
     handler.start()
 
