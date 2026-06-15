@@ -562,6 +562,7 @@ class Session:
     pending_tool_request: Optional[dict] = None  # ツール許可リクエスト {"tools": [...], "user_id": "..."}
     pending_fork: bool = False  # True: 次のタスク実行時に --fork-session を付与（1回消費）
     prompts: list[str] = field(default_factory=list)  # ユーザー指示の履歴（永続化）
+    pending_followup: list[dict] = field(default_factory=list)  # 実行中に受けた追加指示のキュー。タスク完了時(_executeのfinally)に順次 --resume 発火。各要素: {text, user_id, files, request_msg_ts, mode("queue"|"cancel")}
 
     @property
     def active_task(self) -> Optional[Task]:
@@ -2401,6 +2402,54 @@ class ClaudeCodeRunner:
         _schedule_home_refresh()
         return None
 
+    def _fire_one_followup(self, project: "Project", session: "Session"):
+        """pending_followup を1件取り出し --resume 新タスクとして発火（FIFO・直列）。
+        タスク完了/中断時の _execute finally から呼ばれる。残りキューは発火した
+        タスク自身の finally が順に処理するため、ここでは1件だけ起こせばよい。
+        この時点で _execute は JSONL を読み切り、session.claude_session_id は確定済み
+        （取得できなければ resume 先が存在しないので新規タスクとして起動）。"""
+        with self.lock:
+            if not session.pending_followup:
+                return
+            fu = session.pending_followup.pop(0)
+        text = fu.get("text", "")
+        if not text or not text.strip():
+            return
+        # cancel モード（@bot cancel <指示>）: 中断した旨の補足を前置して文脈を補う
+        if fu.get("mode") == "cancel":
+            text = t("followup_cancel_prefix") + text
+        # 添付ファイル（queue パスでは DL 済みパスが text に埋め込まれているため通常は空）
+        files = fu.get("files") or []
+        if files and session.working_dir:
+            file_paths = _download_slack_files(files, session.working_dir)
+            if file_paths:
+                text = _augment_prompt_with_files(text, file_paths)
+
+        task = Task(
+            id=0,
+            prompt=text,
+            allowed_tools=session.consume_tools(),
+            user_id=fu.get("user_id", ""),
+        )
+        if session.claude_session_id:
+            task.resume_session = session.claude_session_id
+            if session.consume_fork():
+                task.fork_session = True
+            logger.info("_fire_one_followup: firing with --resume sid=%s mode=%s thread=%s",
+                        session.claude_session_id[:16], fu.get("mode"), session.thread_ts)
+        else:
+            logger.warning("_fire_one_followup: no session_id, firing fresh task thread=%s", session.thread_ts)
+
+        self.assign_task_id(task)
+        task.reaction_targets = _build_reaction_targets(
+            session.channel_id, fu.get("request_msg_ts"), session.thread_ts,
+        )
+        self._swap_task_reaction(task, REACTION_RECEIVED)
+        self._post_to_session(session, t("followup_firing"))
+        err = self.run_task(project, session, task)
+        if err:
+            self._post_to_session(session, err)
+
     def _execute(self, project: Project, session: Session, task: Task):
         logger.info("_execute: starting task=%s thread=%s resume=%s cwd=%s",
                     task.short_id, session.thread_ts, task.resume_session[:16] if task.resume_session else "None", session.working_dir)
@@ -2678,6 +2727,14 @@ class ClaudeCodeRunner:
             except Exception as e:
                 logger.warning("record_session_history failed: %s", e)
             _schedule_home_refresh()
+            # 実行中に積まれた追加指示（pending_followup）を発火。
+            # この時点で teardown 完了・session_id 確定済みなので競合なく --resume できる。
+            # takeover（bind live）中は別フローが管理するため firing しない。
+            if not is_takeover:
+                try:
+                    self._fire_one_followup(project, session)
+                except Exception as e:
+                    logger.warning("_fire_one_followup failed: %s", e)
 
     def _format_result(self, task: Task, session: Session, elapsed: float,
                        show_result: bool = True) -> tuple[str, list[dict], str | None]:
@@ -3280,6 +3337,15 @@ def handle_message(event, say):
                     if cmd_lower == "cancel":
                         _handle_cancel_in_thread(say, parent_ts, channel_id)
                         return
+                    if cmd_lower.startswith("cancel "):
+                        # cancel <指示>: 現タスクを中断し補足付きで追加指示を即発火
+                        instr = stripped[7:].strip()
+                        session = runner.get_or_create_project(channel_id).sessions.get(parent_ts)
+                        if instr and session:
+                            _enqueue_followup(session, instr, user_id,
+                                              _resolve_event_files(event, channel_id),
+                                              event.get("ts"), "cancel", say, parent_ts)
+                            return
                     if cmd_lower == "status":
                         _handle_status(say, parent_ts, channel_id)
                         return
@@ -3293,7 +3359,8 @@ def handle_message(event, say):
                 input_text = stripped if stripped != text else text
                 input_text = "/" + input_text[1:] if input_text.startswith("!") else input_text
                 handled = _handle_instance_input(input_text, say, parent_ts, channel_id,
-                                                _resolve_event_files(event, channel_id))
+                                                _resolve_event_files(event, channel_id),
+                                                user_id, event.get("ts"))
                 if handled:
                     return
                 logger.info("Thread reply: instance_input returned False (EIO), falling through thread=%s", parent_ts)
@@ -3336,9 +3403,24 @@ def handle_message(event, say):
                     if cmd_lower == "cancel":
                         _handle_cancel_in_thread(say, parent_ts, channel_id)
                         return
+                    if cmd_lower.startswith("cancel "):
+                        # cancel <指示>: 実行中なら中断して即発火、idleならそのまま新タスク
+                        instr = input_text[7:].strip()
+                        if instr and session.active_task:
+                            _enqueue_followup(session, instr, user_id,
+                                              _resolve_event_files(event, channel_id),
+                                              event.get("ts"), "cancel", say, parent_ts)
+                            return
+                        input_text = instr or input_text
                     if cmd_lower == "status":
                         _handle_status(say, parent_ts, channel_id)
                         return
+                # 実行中タスクがあれば追加指示としてキュー（完走後に --resume 発火）
+                if session.active_task and session.active_task.status == TaskStatus.RUNNING:
+                    _enqueue_followup(session, input_text, user_id,
+                                      _resolve_event_files(event, channel_id),
+                                      event.get("ts"), "queue", say, parent_ts)
+                    return
                 # 新タスクとして --resume 続行（メンション有無問わず）
                 resolved_files = _resolve_event_files(event, channel_id)
                 _handle_thread_reply_task(
@@ -3683,10 +3765,49 @@ end if
 '''
 
 
+def _enqueue_followup(session: "Session", text: str, user_id: str,
+                      files: list[dict] | None, request_msg_ts: str | None,
+                      mode: str, say, thread_ts: str):
+    """実行中タスクへの追加指示を pending_followup に積む。
+    mode='queue': 現タスクを完走させ、完了時(_executeのfinally)に --resume 発火。
+    mode='cancel': 既存キューを破棄し、現タスクを中断して、この指示だけを補足付きで即発火。
+    発火自体は _execute の finally → _fire_one_followup が行う（競合回避）。"""
+    if not text or not text.strip():
+        return
+    entry = {
+        "text": text,
+        "user_id": user_id or "",
+        "files": files or [],
+        "request_msg_ts": request_msg_ts,
+        "mode": mode,
+    }
+    if mode == "cancel":
+        # cancel <指示>: 「中断して今すぐこれを」の意。引数なし cancel と同様に
+        # 既存キューも破棄し、この指示のみを中断後に即発火する。
+        with runner.lock:
+            dropped = len(session.pending_followup)
+            session.pending_followup.clear()
+            session.pending_followup.append(entry)
+        msg = t("followup_queued_cancel")
+        if dropped:
+            msg += " " + t("followup_dropped", count=dropped)
+        say(text=msg, thread_ts=thread_ts)
+        active = session.active_task
+        if active and active.status == TaskStatus.RUNNING:
+            runner.cancel_task(active.id)
+    else:
+        with runner.lock:
+            session.pending_followup.append(entry)
+            qlen = len(session.pending_followup)
+        say(text=t("followup_queued", count=qlen), thread_ts=thread_ts)
+
+
 def _handle_instance_input(text: str, say, parent_ts: str, channel_id: str,
-                           files: list[dict] | None = None) -> bool:
+                           files: list[dict] | None = None,
+                           user_id: str = "", request_msg_ts: str | None = None) -> bool:
     """インスタンススレッドへの返信をPTY書き込みまたはクリップボード+ペースト経由でターミナルに転送。
     pending_questionがある場合は選択肢回答として処理する。
+    質問待ちでない実行中タスクへのフリーテキストは pending_followup に積む（完了後に --resume 発火）。
     戻り値: True=処理済み, False=EIOでinstance_threadsから除去済み（呼び出し元でフォールスルーすべき）"""
     inst = instance_threads[parent_ts]
 
@@ -3745,8 +3866,13 @@ def _handle_instance_input(text: str, say, parent_ts: str, channel_id: str,
                 os.write(master_fd, text.encode("utf-8") + b"\r")
                 action_label = None
             else:
-                # 質問待ちでない → タスク実行中なので入力を受け付けない
-                say(text=t("input_blocked_task_running"), thread_ts=parent_ts)
+                # 質問待ちでない → 実行中タスクへの追加指示。キューに積み完了後に --resume 発火
+                session_ref = inst.get("session")
+                if session_ref is not None:
+                    _enqueue_followup(session_ref, text, user_id, None,
+                                      request_msg_ts, "queue", say, parent_ts)
+                else:
+                    say(text=t("input_blocked_task_running"), thread_ts=parent_ts)
                 return True
 
             # Slack通知
@@ -4653,6 +4779,11 @@ def _handle_status(say, thread_ts, channel_id: str):
                 "type": "context",
                 "elements": [{"type": "mrkdwn", "text": t("status_recent_tools", tools=recent_tools)}],
             })
+        if session.pending_followup:
+            blocks.append({
+                "type": "context",
+                "elements": [{"type": "mrkdwn", "text": t("status_followup_queued", count=len(session.pending_followup))}],
+            })
 
     fallback = t("status_running_tasks_header", count=len(active_sessions))
     say(text=fallback, blocks=blocks, thread_ts=thread_ts)
@@ -4689,9 +4820,16 @@ def _handle_cancel_in_thread(say, thread_ts: str, channel_id: str):
     if not session or not session.active_task or session.active_task.status != TaskStatus.RUNNING:
         say(text=t("error_cancel_no_active"), thread_ts=thread_ts)
         return
+    # 引数なし cancel はキュー済みの追加指示も破棄（中断のみで終わらせる）
+    with runner.lock:
+        dropped = len(session.pending_followup)
+        session.pending_followup.clear()
     task_id = session.active_task.id
     if runner.cancel_task(task_id):
-        say(text=t("task_cancel_request_sent", task_id=task_id), thread_ts=thread_ts)
+        msg = t("task_cancel_request_sent", task_id=task_id)
+        if dropped:
+            msg += " " + t("followup_dropped", count=dropped)
+        say(text=msg, thread_ts=thread_ts)
     else:
         say(text=t("task_not_running", task_id=task_id), thread_ts=thread_ts)
 

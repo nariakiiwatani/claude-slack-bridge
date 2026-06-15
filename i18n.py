@@ -21,7 +21,9 @@ MESSAGES: dict[str, dict[str, str]] = {
             "• `@bot team <タスク>` → Team Agentで並列実行（root設定時）\n"
             "*スレッド返信:*\n"
             "• `<指示>` → 同セッションで自動続行（メンション不要）\n"
-            "• `@bot cancel` → このスレッドのタスクをキャンセル\n"
+            "• 実行中に送ると → 完了後に続けて実行（キュー）\n"
+            "• `@bot cancel <指示>` → 実行中を中断して追加指示を即実行\n"
+            "• `@bot cancel` → このスレッドのタスクをキャンセル（キューも破棄）\n"
             "• `@bot status` → タスクの状態一覧\n"
             "• `@bot tools <tool1,...>` → 次回の許可ツール設定\n"
             "*管理:*\n"
@@ -45,6 +47,7 @@ MESSAGES: dict[str, dict[str, str]] = {
         "status_elapsed_seconds": "({elapsed:.0f}秒)",
         "status_elapsed_tools": "({elapsed:.0f}秒, ツール{tool_count}回)",
         "status_recent_tools": "最近: {tools}",
+        "status_followup_queued": ":inbox_tray: 追加指示 {count} 件待機中（完了後に実行）",
         "status_continued": "...(続き)",
 
         # ── task ──
@@ -170,6 +173,13 @@ MESSAGES: dict[str, dict[str, str]] = {
         "input_answer_sent": ":arrow_right: PID {pid} に回答を送信: {label} :white_check_mark:",
         "input_selected_option": "選択肢 {num} ({label}) を選択",
         "input_blocked_task_running": ":hourglass_flowing_sand: タスク実行中のため、新しい指示は受け付けられません。完了後にもう一度返信してください。",
+
+        # ── followup (実行中の追加指示キュー) ──
+        "followup_queued": ":inbox_tray: 追加指示を受け付けました（実行中タスクの完了後に続けて実行します・待機 {count} 件）",
+        "followup_queued_cancel": ":fast_forward: 実行中タスクを中断して、追加指示を反映します",
+        "followup_firing": ":arrow_forward: 追加指示を実行します",
+        "followup_cancel_prefix": "（前のタスクは新しい指示のため中断されました。これまでの作業内容を踏まえて、続けて次の指示に対応してください）\n\n追加指示: ",
+        "followup_dropped": "（キュー済みの追加指示 {count} 件も破棄しました）",
 
         # ── notify (起動/停止通知) ──
         "notify_startup": (
@@ -314,7 +324,9 @@ MESSAGES: dict[str, dict[str, str]] = {
             "• `@bot team <task>` → Run with Team Agent (when root is set)\n"
             "*Thread replies:*\n"
             "• `<instruction>` → Continue in same session (no mention needed)\n"
-            "• `@bot cancel` → Cancel this thread's task\n"
+            "• Sent while running → queued, runs after the current task finishes\n"
+            "• `@bot cancel <instruction>` → Interrupt the running task and run it now\n"
+            "• `@bot cancel` → Cancel this thread's task (also drops the queue)\n"
             "• `@bot status` → Show task status\n"
             "• `@bot tools <tool1,...>` → Set allowed tools for next task\n"
             "*Management:*\n"
@@ -338,6 +350,7 @@ MESSAGES: dict[str, dict[str, str]] = {
         "status_elapsed_seconds": "({elapsed:.0f}s)",
         "status_elapsed_tools": "({elapsed:.0f}s, {tool_count} tool calls)",
         "status_recent_tools": "Recent: {tools}",
+        "status_followup_queued": ":inbox_tray: {count} queued instruction(s) (run after completion)",
         "status_continued": "...(continued)",
 
         # ── task ──
@@ -463,6 +476,13 @@ MESSAGES: dict[str, dict[str, str]] = {
         "input_answer_sent": ":arrow_right: Answer sent to PID {pid}: {label} :white_check_mark:",
         "input_selected_option": "Option {num} ({label}) selected",
         "input_blocked_task_running": ":hourglass_flowing_sand: A task is currently running. Please reply again after it completes.",
+
+        # ── followup (queued instructions while a task is running) ──
+        "followup_queued": ":inbox_tray: Got it — queued to run after the current task finishes ({count} waiting)",
+        "followup_queued_cancel": ":fast_forward: Interrupting the running task to apply your new instruction",
+        "followup_firing": ":arrow_forward: Running the queued instruction",
+        "followup_cancel_prefix": "(The previous task was interrupted in favor of a new instruction. Building on the work done so far, please continue with the following.)\n\nAdditional instruction: ",
+        "followup_dropped": "(Also discarded {count} queued instruction(s))",
 
         # ── notify ──
         "notify_startup": (

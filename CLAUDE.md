@@ -61,7 +61,7 @@ Main logic is in `bridge.py`. Internationalization is in `i18n.py` (bilingual ja
 
 - **Access control** — `_is_user_allowed()` and `_is_channel_allowed()` check whitelists. `ADMIN_SLACK_USER_ID` is always allowed. `*` means allow all.
 
-- **Slack event handler** — `handle_message` is the main event handler. Routes channel events (whitelisted, mention required for top-level). Thread reply routing: (1) `instance_threads` registered → mention=command (`cancel`/`status`/`tools`), otherwise forward to CLI stdin, (1.5) `pending_directory_requests` / `pending_fork_selections` / `pending_bind_selections` → selection handling, (2) session exists → mention=command, otherwise auto-resume via new task, (3) fallback to command (mention required). `_dispatch_command` is the command parser. `handle_mention` (`app_mention` event) is a no-op to avoid duplicate processing.
+- **Slack event handler** — `handle_message` is the main event handler. Routes channel events (whitelisted, mention required for top-level). Thread reply routing: (1) `instance_threads` registered → mention=command (`cancel`/`cancel <instr>`/`status`/`tools`), otherwise forward to CLI stdin (or, for a running PTY task, queue as a follow-up — see "Mid-task follow-up instructions"), (1.5) `pending_directory_requests` / `pending_fork_selections` / `pending_bind_selections` → selection handling, (2) session exists → mention=command, otherwise auto-resume via new task (queued instead if a task is still running), (3) fallback to command (mention required). `_dispatch_command` is the command parser. `handle_mention` (`app_mention` event) is a no-op to avoid duplicate processing.
 
 - **Notifications** — `NOTIFICATION_CHANNEL` (optional) receives startup/shutdown notifications. If unset, these are logged only.
 
@@ -91,6 +91,15 @@ Main logic is in `bridge.py`. Internationalization is in `i18n.py` (bilingual ja
 ### Session Continuity
 
 Thread replies to a session's Slack thread automatically create new tasks with `--resume <session.claude_session_id>`. The old `continue` and `resume` commands are deprecated. Each session maintains its own `claude_session_id`, label, and working directory.
+
+### Mid-task follow-up instructions (pending_followup)
+
+Replies sent **while a task is still running** are no longer rejected — they are queued and auto-fired as a `--resume` task after the current one ends (matching the interactive CLI's "type while it's working, processed at the next turn" UX). Two modes:
+
+- **Queue (default)** — a plain reply during a running task appends to `session.pending_followup` (`mode="queue"`) and the current task runs to completion first. Cheapest (no wasted work, tool set unchanged → prompt cache preserved).
+- **Cancel (`@bot cancel <instruction>`)** — appends with `mode="cancel"` then immediately cancels the running task; on fire, the prompt is prefixed with `followup_cancel_prefix` so the resumed Claude knows it was interrupted. Equivalent to Esc-then-retype in the CLI.
+
+Firing happens in `_execute`'s `finally` via `ClaudeCodeRunner._fire_one_followup` — **after** teardown (`instance_threads` removal, `clear_active_task`) and **after** `session.claude_session_id` is settled (the JSONL fallback at the end of `_execute` runs first). This structurally avoids the same-session/JSONL race and removes any need for a timeout wait on the session id. Only one item is popped per `finally`; the fired task's own `finally` drains the next, giving FIFO serial execution. Skipped when the session is in bind/takeover mode (`is_takeover`). `@bot cancel` with no argument also clears the queue. Enqueue entry points: the reject branch of `_handle_instance_input` (PTY tasks) and an `active_task`-running guard in `handle_message`'s session path (covers the stdin-fallback path that isn't registered in `instance_threads`). `_enqueue_followup` builds the queue entries; `status` shows the per-session queued count.
 
 ### Persistence
 
