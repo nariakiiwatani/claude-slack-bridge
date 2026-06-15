@@ -187,6 +187,18 @@ MESSAGES: dict[str, dict[str, str]] = {
             "チャンネルで `@bot in <path> <タスク>` を送信してください"
         ),
         "notify_shutdown": ":wave: Claude Code Bridge を停止しました",
+        # ── update (GitHub 更新通知) ──
+        "update_available": (
+            ":sparkles: *アップデートがあります*\n"
+            "新しいバージョンが公開されています。下のボタンで適用できます。"
+        ),
+        "update_apply_button": "アップデートを適用",
+        "update_applying": ":hourglass_flowing_sand: アップデートを適用しています…",
+        "update_done": ":white_check_mark: アップデートを適用しました。再起動します。",
+        "update_failed": (
+            ":warning: 自動アップデートに失敗しました（{reason}）。\n"
+            "お手数ですが手動で更新してください。"
+        ),
         "notify_missing_scopes": (
             ":warning: *Slack Bot の権限が不足しています*\n"
             "未付与のスコープ: `{scopes}`\n"
@@ -490,6 +502,18 @@ MESSAGES: dict[str, dict[str, str]] = {
             "Send `@bot in <path> <task>` in a channel to begin"
         ),
         "notify_shutdown": ":wave: Claude Code Bridge stopped",
+        # ── update (GitHub update notification) ──
+        "update_available": (
+            ":sparkles: *An update is available*\n"
+            "A newer version has been released. Apply it with the button below."
+        ),
+        "update_apply_button": "Apply update",
+        "update_applying": ":hourglass_flowing_sand: Applying the update…",
+        "update_done": ":white_check_mark: Update applied. Restarting.",
+        "update_failed": (
+            ":warning: Auto-update failed ({reason}).\n"
+            "Please update manually."
+        ),
         "notify_missing_scopes": (
             ":warning: *Slack Bot is missing permissions*\n"
             "Scopes not granted: `{scopes}`\n"

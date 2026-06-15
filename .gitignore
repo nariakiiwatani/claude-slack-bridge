@@ -27,6 +27,9 @@ channel_roots.json
 # Project approved tools
 project_tools.json
 
+# GitHub update check: installed SHA baseline (non-git installs)
+github_update_state.json
+
 # macOS
 .DS_Store
 
